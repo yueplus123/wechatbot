@@ -1,0 +1,44 @@
+{% load static %}
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}薪火记账{% endblock %}</title>
+  <link rel="stylesheet" href="{% static 'panel/panel.css' %}">
+</head>
+<body>
+{% if request.user.is_authenticated %}
+<div class="layout">
+  <aside class="nav">
+    <div class="brand">薪火记账</div>
+    <a href="{% url 'panel:home' %}" class="{% if request.resolver_match.url_name == 'home' or request.resolver_match.url_name == 'room_detail' %}active{% endif %}">概览</a>
+    <a href="{% url 'panel:book' 'staff_order' %}" class="{% if book == 'staff_order' %}active{% endif %}">员工记单</a>
+    <a href="{% url 'panel:book' 'ledger' %}" class="{% if book == 'ledger' %}active{% endif %}">记账</a>
+    <a href="{% url 'panel:book' 'usdt' %}" class="{% if book == 'usdt' %}active{% endif %}">USDT</a>
+    <a href="{% url 'panel:logs' %}" class="{% if request.resolver_match.url_name == 'logs' %}active{% endif %}">日志</a>
+    <div class="meta">
+      <div><span class="dot {% if worker_running %}on{% else %}off{% endif %}"></span>Worker {% if worker_running %}运行中{% else %}未启动{% endif %}</div>
+      <div><span class="dot {% if not paused %}on{% else %}off{% endif %}"></span>听群 {% if paused %}已暂停{% else %}监听中{% endif %}</div>
+      <form method="post" action="{% url 'panel:logout' %}" style="margin-top:12px">
+        {% csrf_token %}
+        <button class="btn small" type="submit">退出 {{ request.user.username }}</button>
+      </form>
+    </div>
+  </aside>
+  <main class="main">
+    {% if messages %}
+    <ul class="flash">
+      {% for message in messages %}
+      <li class="{{ message.tags }}">{{ message }}</li>
+      {% endfor %}
+    </ul>
+    {% endif %}
+    {% block content %}{% endblock %}
+  </main>
+</div>
+{% else %}
+{% block body %}{% endblock %}
+{% endif %}
+</body>
+</html>

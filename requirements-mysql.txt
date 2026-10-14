@@ -1,0 +1,2 @@
+# 仅当 config/.env 里 USE_MYSQL=1 时需要
+mysqlclient>=2.2.0

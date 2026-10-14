@@ -1,0 +1,127 @@
+{% extends "panel/base.html" %}
+{% block title %}{{ book_label }} · 薪火记账{% endblock %}
+{% block content %}
+<h1 class="page-title">{{ book_label }}</h1>
+<p class="page-sub">记录与关键词管理（与桌面控制台同一套数据）。</p>
+
+<div class="tabs">
+  <a href="?tab=records" class="{% if tab != 'keywords' %}active{% endif %}">记录</a>
+  <a href="?tab=keywords" class="{% if tab == 'keywords' %}active{% endif %}">关键词</a>
+</div>
+
+{% if tab != 'keywords' %}
+<div class="panel">
+  <form method="get" class="row" style="margin-bottom:14px">
+    <input type="hidden" name="tab" value="records">
+    <input class="grow" name="q" value="{{ q }}" placeholder="搜索项目 / 人 / 群 / 单号">
+    <button class="btn" type="submit">搜索</button>
+  </form>
+
+  <details style="margin-bottom:16px">
+    <summary>手动补记</summary>
+    <form method="post" action="{% url 'panel:entry_add' book %}" style="margin-top:12px" class="row">
+      {% csrf_token %}
+      <select name="person" required>
+        <option value="">提交人</option>
+        {% for e in employees %}<option>{{ e }}</option>{% endfor %}
+      </select>
+      <select name="room" required>
+        <option value="">群</option>
+        {% for r in rooms %}<option>{{ r }}</option>{% endfor %}
+      </select>
+      <input name="business_name" placeholder="项目/业务名" required>
+      {% if book == 'staff_order' %}
+      <input name="amount" placeholder="数量" style="width:100px">
+      <select name="direction">
+        <option value="income">增加</option>
+        <option value="expense">减少</option>
+      </select>
+      {% else %}
+      <input name="receive_amount" placeholder="金额" style="width:90px">
+      <input name="amount_to_you" placeholder="给你" style="width:90px">
+      <input name="amount_to_me" placeholder="给我" style="width:90px">
+      <input name="profit_amount" placeholder="利润" style="width:90px">
+      {% endif %}
+      <button class="btn primary" type="submit">添加</button>
+    </form>
+  </details>
+
+  <table>
+    <thead>
+      <tr>
+        <th>单号</th><th>项目</th>
+        {% if book == 'staff_order' %}<th>数量</th><th>方向</th>{% else %}<th>金额</th><th>给你</th><th>给我</th><th>利润</th>{% endif %}
+        <th>人</th><th>群</th><th>状态</th><th></th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for e in entries %}
+      <tr>
+        <td>{{ e.record_no }}</td>
+        <td>{{ e.business_name }}</td>
+        {% if book == 'staff_order' %}
+        <td>{{ e.amount }}</td>
+        <td>{{ e.direction_label }}</td>
+        {% else %}
+        <td>{{ e.receive_amount }}</td>
+        <td>{{ e.amount_to_you }}</td>
+        <td>{{ e.amount_to_me }}</td>
+        <td>{{ e.profit_amount }}</td>
+        {% endif %}
+        <td>{{ e.person }}</td>
+        <td>{{ e.room }}</td>
+        <td>{{ e.status_label }}</td>
+        <td>
+          {% if e.status == 'ACTIVE' %}
+          <form method="post" action="{% url 'panel:entry_action' book %}">
+            {% csrf_token %}
+            <input type="hidden" name="entry_id" value="{{ e.id }}">
+            <input type="hidden" name="action" value="reverse">
+            <button class="btn small danger" type="submit">撤销</button>
+          </form>
+          {% endif %}
+        </td>
+      </tr>
+      {% empty %}
+      <tr><td colspan="10">暂无记录</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% else %}
+<div class="panel">
+  <form method="post" action="{% url 'panel:keyword_add' book %}" class="row" style="margin-bottom:16px">
+    {% csrf_token %}
+    <input name="keyword" placeholder="关键词" required>
+    <input class="grow" name="usages" placeholder="用法说明（可选）">
+    <button class="btn primary" type="submit">添加</button>
+  </form>
+  <table>
+    <thead><tr><th>关键词</th><th>用法</th><th>状态</th><th></th></tr></thead>
+    <tbody>
+      {% for k in keywords %}
+      <tr>
+        <td>{{ k.keyword }}</td>
+        <td>{{ k.usages }}</td>
+        <td><span class="badge {% if k.enabled %}on{% else %}off{% endif %}">{{ k.enabled_label }}</span></td>
+        <td class="row">
+          <form method="post" action="{% url 'panel:keyword_toggle' book %}">
+            {% csrf_token %}
+            <input type="hidden" name="kw_id" value="{{ k.id }}">
+            <button class="btn small" type="submit">{% if k.enabled %}停用{% else %}启用{% endif %}</button>
+          </form>
+          <form method="post" action="{% url 'panel:keyword_delete' book %}">
+            {% csrf_token %}
+            <input type="hidden" name="kw_id" value="{{ k.id }}">
+            <button class="btn small danger" type="submit">删除</button>
+          </form>
+        </td>
+      </tr>
+      {% empty %}
+      <tr><td colspan="4">暂无关键词</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% endif %}
+{% endblock %}

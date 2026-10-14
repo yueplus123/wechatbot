@@ -1,0 +1,238 @@
+{% extends "panel/base.html" %}
+{% block title %}{{ room.name }} · 听群{% endblock %}
+{% block content %}
+<h1 class="page-title">{{ room.name }}</h1>
+<p class="page-sub">
+  <a href="{% url 'panel:home' %}">← 返回概览</a>
+  ·
+  <span class="badge {% if room.enabled %}on{% else %}off{% endif %}">{% if room.enabled %}监听中{% else %}已停用{% endif %}</span>
+</p>
+
+<div id="flash-box"></div>
+
+<div class="panel">
+  <h2>人员绑定</h2>
+  <div class="row" style="margin-bottom:12px">
+    <form method="post" action="{% url 'panel:room_load_nicks' room.id %}">
+      {% csrf_token %}
+      <button class="btn" type="submit">读取群成员昵称</button>
+    </form>
+    <span style="color:var(--muted)" id="nick-status">
+      {% if nick_total %}已读取 {{ nick_total }} 个，待绑定 {{ nicks|length }} 个{% else %}请先读取群成员昵称{% endif %}
+    </span>
+  </div>
+  <form method="post" action="{% url 'panel:binding_add' room.id %}" class="row" style="margin-bottom:16px" id="bind-form">
+    {% csrf_token %}
+    <select name="nick" id="nick-select" required style="min-width:180px">
+      <option value="">选择微信群昵称</option>
+      {% for n in nicks %}
+      <option value="{{ n }}">{{ n }}</option>
+      {% endfor %}
+    </select>
+    <input name="display" id="display-input" placeholder="显示名 / 备注（可同昵称）">
+    <select name="role" id="role-select">
+      <option value="staff">员工</option>
+      <option value="admin">管理员</option>
+    </select>
+    <button class="btn primary" type="submit" id="bind-submit">添加绑定</button>
+  </form>
+  <p class="muted" style="margin-top:-8px">选昵称即自动填入显示名，默认「员工」，点一次即可绑定；已绑定的人不会再出现在下拉里，可连续绑定多人。</p>
+  <table>
+    <thead><tr><th>群昵称</th><th>显示名</th><th>角色</th><th>操作</th></tr></thead>
+    <tbody id="bind-tbody">
+      {% for b in bindings %}
+      <tr data-bind-id="{{ b.id }}">
+        <td>{{ b.nick }}</td>
+        <td>{{ b.display }}</td>
+        <td>{{ b.role_label }}</td>
+        <td class="row">
+          <form method="post" action="{% url 'panel:binding_role' room.id %}">
+            {% csrf_token %}
+            <input type="hidden" name="bind_id" value="{{ b.id }}">
+            <input type="hidden" name="role" value="{% if b.role == 'admin' %}staff{% else %}admin{% endif %}">
+            <button class="btn small" type="submit">设为{% if b.role == 'admin' %}员工{% else %}管理员{% endif %}</button>
+          </form>
+          <form method="post" action="{% url 'panel:binding_remove' room.id %}">
+            {% csrf_token %}
+            <input type="hidden" name="bind_id" value="{{ b.id }}">
+            <button class="btn small danger" type="submit">移除</button>
+          </form>
+        </td>
+      </tr>
+      {% empty %}
+      <tr id="bind-empty"><td colspan="4">暂无绑定</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+
+<div class="panel">
+  <h2>账本 / 业务范围</h2>
+  <form method="post" action="{% url 'panel:room_settings_save' room.id %}">
+    {% csrf_token %}
+
+    <div class="settings-block">
+      <div class="settings-label">启用的账本</div>
+      <div class="check-grid check-grid-books">
+        {% for b in settings.books %}
+        <label class="check-item">
+          <input type="checkbox" name="books" value="{{ b.book }}" {% if b.checked %}checked{% endif %}>
+          <span class="check-text">
+            <span class="check-title">{{ b.label }}</span>
+          </span>
+        </label>
+        {% endfor %}
+      </div>
+    </div>
+
+    <div class="settings-block">
+      <div class="settings-label">员工记单 · 普通业务</div>
+      <div class="check-grid check-grid-simple">
+        {% for it in settings.biz_simple %}
+        <label class="check-item">
+          <input type="checkbox" name="biz_keys" value="{{ it.key }}" {% if it.checked %}checked{% endif %}>
+          <span class="check-text">
+            <span class="check-title">{{ it.title }}</span>
+            {% if it.hint %}<span class="check-hint">{{ it.hint }}</span>{% endif %}
+          </span>
+        </label>
+        {% empty %}
+        <span class="check-empty">暂无</span>
+        {% endfor %}
+      </div>
+    </div>
+
+    <div class="settings-block">
+      <div class="settings-label">员工记单 · 多规格业务</div>
+      <div class="check-grid check-grid-multi">
+        {% for it in settings.biz_multi %}
+        <label class="check-item check-item-multi">
+          <input type="checkbox" name="biz_keys" value="{{ it.key }}" {% if it.checked %}checked{% endif %}>
+          <span class="check-text">
+            <span class="check-title">{{ it.title }} <em>多规格</em></span>
+            {% if it.hint %}<span class="check-hint">{{ it.hint }}</span>{% endif %}
+          </span>
+        </label>
+        {% empty %}
+        <span class="check-empty">暂无</span>
+        {% endfor %}
+      </div>
+    </div>
+
+    <button class="btn primary" type="submit">保存设置</button>
+  </form>
+</div>
+
+<script>
+(function () {
+  var form = document.getElementById("bind-form");
+  var sel = document.getElementById("nick-select");
+  var disp = document.getElementById("display-input");
+  var statusEl = document.getElementById("nick-status");
+  var tbody = document.getElementById("bind-tbody");
+  var flashBox = document.getElementById("flash-box");
+  var roomId = {{ room.id }};
+  var addUrl = "{% url 'panel:binding_add' room.id %}";
+  var roleUrl = "{% url 'panel:binding_role' room.id %}";
+  var removeUrl = "{% url 'panel:binding_remove' room.id %}";
+  var csrf = (document.querySelector("#bind-form input[name=csrfmiddlewaretoken]") || {}).value || "";
+
+  if (sel && disp) {
+    sel.addEventListener("change", function () {
+      if (sel.value && !disp.value) disp.value = sel.value;
+    });
+  }
+  if (!form) return;
+
+  function showFlash(text, ok) {
+    flashBox.innerHTML = '<ul class="flash"><li class="' + (ok ? "success" : "error") + '">' + text + "</li></ul>";
+  }
+
+  function rebuildSelect(nicks, nickTotal) {
+    var cur = sel.value;
+    sel.innerHTML = '<option value="">选择微信群昵称</option>';
+    (nicks || []).forEach(function (n) {
+      var opt = document.createElement("option");
+      opt.value = n;
+      opt.textContent = n;
+      sel.appendChild(opt);
+    });
+    if (statusEl) {
+      statusEl.textContent = nickTotal
+        ? ("已读取 " + nickTotal + " 个，待绑定 " + (nicks || []).length + " 个")
+        : "请先读取群成员昵称";
+    }
+  }
+
+  function rebuildTable(bindings) {
+    tbody.innerHTML = "";
+    if (!bindings || !bindings.length) {
+      tbody.innerHTML = '<tr id="bind-empty"><td colspan="4">暂无绑定</td></tr>';
+      return;
+    }
+    bindings.forEach(function (b) {
+      var nextRole = b.role === "admin" ? "staff" : "admin";
+      var nextLabel = b.role === "admin" ? "员工" : "管理员";
+      var tr = document.createElement("tr");
+      tr.setAttribute("data-bind-id", b.id);
+      tr.innerHTML =
+        "<td>" + b.nick + "</td>" +
+        "<td>" + b.display + "</td>" +
+        "<td>" + b.role_label + "</td>" +
+        '<td class="row">' +
+          '<form method="post" action="' + roleUrl + '">' +
+            '<input type="hidden" name="csrfmiddlewaretoken" value="' + csrf + '">' +
+            '<input type="hidden" name="bind_id" value="' + b.id + '">' +
+            '<input type="hidden" name="role" value="' + nextRole + '">' +
+            '<button class="btn small" type="submit">设为' + nextLabel + "</button>" +
+          "</form>" +
+          '<form method="post" action="' + removeUrl + '">' +
+            '<input type="hidden" name="csrfmiddlewaretoken" value="' + csrf + '">' +
+            '<input type="hidden" name="bind_id" value="' + b.id + '">' +
+            '<button class="btn small danger" type="submit">移除</button>' +
+          "</form>" +
+        "</td>";
+      tbody.appendChild(tr);
+    });
+  }
+
+  form.addEventListener("submit", function (ev) {
+    ev.preventDefault();
+    if (!sel.value) {
+      showFlash("请先选择微信群昵称", false);
+      return;
+    }
+    var fd = new FormData(form);
+    var btn = document.getElementById("bind-submit");
+    if (btn) btn.disabled = true;
+    fetch(addUrl, {
+      method: "POST",
+      body: fd,
+      headers: {
+        "X-Requested-With": "XMLHttpRequest",
+        "Accept": "application/json"
+      },
+      credentials: "same-origin"
+    })
+      .then(function (r) { return r.json().then(function (j) { return { ok: r.ok, j: j }; }); })
+      .then(function (res) {
+        if (!res.ok || !res.j.ok) {
+          showFlash((res.j && res.j.message) || "添加失败", false);
+          return;
+        }
+        showFlash(res.j.message || "已添加", true);
+        rebuildSelect(res.j.nicks || [], res.j.nick_total || 0);
+        rebuildTable(res.j.bindings || []);
+        disp.value = "";
+        sel.value = "";
+      })
+      .catch(function (err) {
+        showFlash("请求失败：" + err, false);
+      })
+      .finally(function () {
+        if (btn) btn.disabled = false;
+      });
+  });
+})();
+</script>
+{% endblock %}

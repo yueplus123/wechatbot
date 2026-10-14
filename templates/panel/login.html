@@ -1,0 +1,19 @@
+{% extends "panel/base.html" %}
+{% block title %}登录 · 薪火记账{% endblock %}
+{% block body %}
+<div class="login-wrap">
+  <div class="login-box">
+    <h1>薪火记账</h1>
+    <p>网页控制台 · 浏览器管理，Windows 只跑网关</p>
+    {% if error %}<p class="err">{{ error }}</p>{% endif %}
+    <form method="post">
+      {% csrf_token %}
+      <label>用户名</label>
+      <input name="username" autocomplete="username" required>
+      <label>密码</label>
+      <input type="password" name="password" autocomplete="current-password" required>
+      <button class="btn primary" type="submit">登录</button>
+    </form>
+  </div>
+</div>
+{% endblock %}

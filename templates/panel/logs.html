@@ -1,0 +1,40 @@
+{% extends "panel/base.html" %}
+{% block title %}日志 · 薪火记账{% endblock %}
+{% block content %}
+<h1 class="page-title">日志</h1>
+<p class="page-sub">Worker / 面板操作写入 <code>data/runtime.log</code>，页面可见时约每 5 秒自动刷新。</p>
+
+<div class="panel">
+  <div class="row" style="margin-bottom:12px">
+    <button class="btn" type="button" id="btn-refresh">立即刷新</button>
+    <form method="post" action="{% url 'panel:logs_clear' %}" onsubmit="return confirm('确定清空日志？')">
+      {% csrf_token %}
+      <button class="btn danger" type="submit">清空日志</button>
+    </form>
+    <span class="muted">{{ log_path }}</span>
+  </div>
+  <pre class="log-box" id="log-box">{% for line in lines %}{{ line }}
+{% endfor %}</pre>
+</div>
+
+<script>
+(function () {
+  var box = document.getElementById("log-box");
+  var url = "{% url 'panel:logs_raw' %}?n=300";
+  function load() {
+    if (document.hidden) return;
+    fetch(url, { credentials: "same-origin" })
+      .then(function (r) { return r.text(); })
+      .then(function (t) {
+        var atBottom = box.scrollTop + box.clientHeight >= box.scrollHeight - 40;
+        box.textContent = t;
+        if (atBottom) box.scrollTop = box.scrollHeight;
+      })
+      .catch(function () {});
+  }
+  document.getElementById("btn-refresh").addEventListener("click", load);
+  setInterval(load, 5000);
+  box.scrollTop = box.scrollHeight;
+})();
+</script>
+{% endblock %}

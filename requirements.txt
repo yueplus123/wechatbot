@@ -1,0 +1,11 @@
+Django>=5.2,<5.3
+djangorestframework>=3.16,<3.17
+python-dotenv>=1.0.0
+waitress>=3.0.0
+openpyxl>=3.1.0
+httpx>=0.27.0,<1.0
+pywechat127>=1.9.8
+pywinauto>=0.6.8
+# 以下仅「点头像 / OCR 识别发送人」用到（SENDER_OCR=0 时可不装 winsdk）
+Pillow>=10.0.0
+winsdk>=1.0.0b10
