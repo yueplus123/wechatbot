@@ -59,10 +59,20 @@ class XinhuoBridge:
     max_retries: int = 2
     # 兼容旧配置的显式覆盖（优先于能力表拼接）
     overrides: dict[str, str] = field(default_factory=dict)
+    # api_key 含中文等非 ASCII 字符（多半没把 .env 模板里的占位文字换掉）
+    api_key_invalid: bool = False
 
     def __post_init__(self) -> None:
         self.api_base = (self.api_base or "").strip().rstrip("/")
         self.api_key = (self.api_key or "").strip()
+        if self.api_key and not self.api_key.isascii():
+            # HTTP 请求头只能是 ASCII，带中文会抛 'ascii' codec 错误；按未配置处理
+            logger.error(
+                "XINHUO_BOT_PUSH_API_KEY 含中文/非 ASCII 字符，多半还是模板占位文字，"
+                "请在 config/.env 填入真实密钥"
+            )
+            self.api_key = ""
+            self.api_key_invalid = True
         self.timeout = float(self.timeout or 8)
         self.max_retries = max(0, int(self.max_retries or 0))
 
@@ -147,6 +157,7 @@ class XinhuoBridge:
             "effective_push_url": ledger.get("url") or "",
             "capabilities": caps,
             "api_key_set": bool(key),
+            "api_key_invalid": self.api_key_invalid,
             "api_key_masked": (("*" * max(0, len(key) - 4)) + key[-4:]) if key else "",
             "timeout": self.timeout,
             "max_retries": self.max_retries,
@@ -300,9 +311,14 @@ class XinhuoBridge:
         """探测 bridge_health；若薪火未部署该接口，回退用 ledger pull ping。"""
         info = self.connection_info()
         if not info["ready"]:
+            message = (
+                "API Key 还是模板占位文字：请在 config\\.env 把 XINHUO_BOT_PUSH_API_KEY 换成真实密钥后重启服务"
+                if self.api_key_invalid
+                else "未配置 API Base（或能力 URL）与 API Key"
+            )
             return {
                 "ok": False,
-                "message": "未配置 API Base（或能力 URL）与 API Key",
+                "message": message,
                 **info,
             }
 
