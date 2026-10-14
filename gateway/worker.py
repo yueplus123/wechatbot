@@ -35,6 +35,13 @@ except ImportError:
 from gateway.adapters import create_adapter
 from gateway.adapters.base import MessageType
 from gateway.dedupe import SlidingWindowDedupe, make_fingerprint
+from gateway.perf import (
+    DailyWindowReset,
+    LoadBackoff,
+    SystemCpuSampler,
+    apply_process_limits,
+    env_float,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("gateway.worker")
@@ -189,8 +196,23 @@ def main() -> int:
     gateway_id = os.getenv("GATEWAY_ID", "wx-gateway-01")
     secret = os.getenv("GATEWAY_HMAC_SECRET", "")
     client = GatewayClient(args.api, gateway_id, secret)
+    apply_process_limits()
     adapter = create_adapter(args.adapter)
     adapter.start()
+    # 性能：系统过载时放慢轮询；定期输出耗时统计；每天定时重置群窗口
+    cpu_sampler = SystemCpuSampler()
+    cpu_sampler.sample()
+    backoff = LoadBackoff.from_env()
+    last_cpu: float | None = None
+    stats = getattr(adapter, "stats", None)
+    stats_every = env_float("WORKER_STATS_SECONDS", 600.0)
+    last_stats = time.time()
+    window_reset = DailyWindowReset.from_env(ROOT / "data" / "window_reset.json")
+    can_reset = callable(getattr(adapter, "reset_chat_windows", None))
+    if window_reset.enabled and can_reset:
+        logger.info(
+            "daily window reset at %02d:%02d (WECHAT_WINDOW_RESET_AT)", *window_reset.at
+        )
     local_dedupe = SlidingWindowDedupe(
         window_seconds=int(os.getenv("DEDUP_WINDOW_SECONDS", "15"))
     )
@@ -324,12 +346,37 @@ def main() -> int:
                 time.sleep(2)
                 continue
 
+            if window_reset.enabled and can_reset:
+                local_now = datetime.now()
+                due = window_reset.due_chats(local_now, chats)
+                if due:
+                    logger.info("开始定时重置群窗口: %s", due)
+                    try:
+                        results = adapter.reset_chat_windows(due)
+                    except Exception as exc:  # noqa: BLE001
+                        logger.exception("定时重置群窗口失败: %s", exc)
+                        results = {c: False for c in due}
+                    window_reset.record(local_now, results)
+                    failed = [c for c, ok in results.items() if not ok]
+                    if failed:
+                        logger.error(
+                            "以下群窗口重置失败，%.0f 分钟后重试；如仍失败请手动单独打开并置顶: %s",
+                            window_reset.retry_seconds / 60,
+                            failed,
+                        )
+                    # 窗口句柄变了：下一轮立即重新扫描置顶窗
+                    last_refresh = 0.0
+                    continue
+
+            t_poll = time.perf_counter()
             try:
                 messages = adapter.poll(chats)
             except Exception as exc:  # noqa: BLE001
                 logger.exception("poll failed: %s", exc)
                 time.sleep(2)
                 continue
+            if stats is not None:
+                stats.record_round((time.perf_counter() - t_poll) * 1000)
 
             for msg in messages:
                 if msg.message_type != MessageType.TEXT:
@@ -425,7 +472,38 @@ def main() -> int:
             except Exception as exc:  # noqa: BLE001
                 logger.exception("reply loop failed: %s", exc)
 
-            time.sleep(poll_sleep)
+            # 系统 CPU 持续过高时放慢轮询，给系统留余量，防止整机卡死
+            cpu = cpu_sampler.sample()
+            if cpu is not None:
+                last_cpu = cpu
+            old_factor = backoff.factor
+            factor = backoff.update(cpu)
+            if factor != old_factor:
+                if factor > old_factor:
+                    logger.warning(
+                        "系统 CPU %.0f%% 持续过高，轮询间隔放慢到 %.1fs（x%.0f）",
+                        cpu or 0.0,
+                        poll_sleep * factor,
+                        factor,
+                    )
+                else:
+                    logger.info(
+                        "系统 CPU 回落到 %.0f%%，轮询间隔恢复到 %.1fs",
+                        cpu or 0.0,
+                        poll_sleep * factor,
+                    )
+
+            if stats is not None and stats_every > 0 and now - last_stats >= stats_every:
+                logger.info(
+                    "perf %s | cpu=%s backoff=x%.0f",
+                    stats.summary(),
+                    f"{last_cpu:.0f}%" if last_cpu is not None else "n/a",
+                    backoff.factor,
+                )
+                stats.reset()
+                last_stats = now
+
+            time.sleep(poll_sleep * factor)
     finally:
         adapter.close()
     return 0

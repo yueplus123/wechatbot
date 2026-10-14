@@ -34,6 +34,7 @@ from gateway.chat_names import (
     normalize_chat_name,
     normalize_group_nickname,
 )
+from gateway.perf import PollStats, env_float, env_int
 from gateway.sender_resolve import (
     avatar_side_and_hash,
     bubble_looks_self,
@@ -114,6 +115,20 @@ class PyWeixinAdapter:
         self._posted_ledger: dict[str, dict[str, float]] = {}
         # 点头像冷却，避免连点抢鼠标
         self._avatar_click_at: dict[str, float] = {}
+        # ---- 性能：长时间开窗后消息越积越多，避免每轮全量遍历 ----
+        # 每轮只解析消息列表末尾 N 条（0=全量，旧行为）
+        self._tail_items = max(0, env_int("WECHAT_TAIL_ITEMS", 30))
+        # chat_name -> (消息 List 控件, 缓存时间)；过期或失效才重新遍历窗口找 List
+        self._list_cache: dict[str, tuple[Any, float]] = {}
+        self._list_cache_ttl = env_float("WECHAT_LIST_CACHE_SECONDS", 600.0)
+        # hwnd -> 会话名（读窗内标题要遍历整棵控件树，按句柄缓存）
+        self._hwnd_names: dict[int, str] = {}
+        # chat_name -> 上次实时读取「我的群昵称」的 monotonic 时间
+        self._alias_live_at: dict[str, float] = {}
+        # 本轮读取的统计（由 poll 汇总到 self.stats）
+        self._last_read_items = 0
+        self._last_read_full_scan = False
+        self.stats = PollStats()
 
     def start(self) -> None:
         self._ensure_import()
@@ -152,6 +167,9 @@ class PyWeixinAdapter:
 
         # sticky 模式：轮询阶段不挪鼠标；打开窗口单独处理
         for chat in chat_names:
+            t0 = time.perf_counter()
+            self._last_read_items = 0
+            self._last_read_full_scan = False
             try:
                 if self._listen_mode == "search" and self._allow_search:
                     out.extend(self._poll_chat_search(pyweixin, chat))
@@ -159,6 +177,12 @@ class PyWeixinAdapter:
                     out.extend(self._poll_chat_sticky(pyweixin, chat))
             except Exception as exc:  # noqa: BLE001
                 logger.warning("监听群失败 chat=%s err=%s", chat, exc)
+            self.stats.record_chat(
+                chat,
+                (time.perf_counter() - t0) * 1000,
+                items=self._last_read_items,
+                full_scan=self._last_read_full_scan,
+            )
         return out
 
     def list_senders_in_chat(self, chat_name: str) -> list[str]:
@@ -1355,13 +1379,15 @@ class PyWeixinAdapter:
         new_rows = _diff_new_message_rows(prev, curr)
         # 发送人识别：无鼠标优先；仍未知时才点头像读资料卡
         if new_rows:
-            my_alias = ""
-            try:
-                my_alias = self._read_my_group_alias(win) or ""
-            except Exception:  # noqa: BLE001
-                my_alias = ""
-            if not my_alias:
-                my_alias = load_my_alias(chat_name) or ""
+            # 实时读昵称要遍历整窗控件树：有缓存时最多每 10 分钟实时读一次
+            my_alias = load_my_alias(chat_name) or ""
+            now_m = time.monotonic()
+            if not my_alias or now_m - self._alias_live_at.get(chat_name, 0.0) >= 600:
+                self._alias_live_at[chat_name] = now_m
+                try:
+                    my_alias = self._read_my_group_alias(win) or my_alias
+                except Exception:  # noqa: BLE001
+                    pass
             if my_alias:
                 remember_my_alias(chat_name, my_alias)
             # 绑定表里的本群昵称也作为候选（本机账号常已授权）
@@ -1774,6 +1800,112 @@ class PyWeixinAdapter:
         self._open_failed_at.pop(chat_name, None)
         return win
 
+    # ------------------------------------------------------------ 定时重置群窗口
+
+    def reset_chat_windows(self, chat_names: list[str]) -> dict[str, bool]:
+        """
+        关闭并重新打开监听中的群窗口，清空窗口里越积越多的历史气泡。
+        恢复原位置/大小/置顶；之后该群重新「暖机」（不回放历史）。
+        会短暂操作微信主窗口（搜群打开），应安排在无人发指令的时段。
+        返回 {群名: 是否成功}；本来就没开窗的群不处理、不出现在结果里。
+        """
+        if not self._started:
+            self.start()
+        pyweixin = self._ensure_import()
+        nav = getattr(pyweixin, "Navigator", None)
+        if nav is None or not hasattr(nav, "open_seperate_dialog_window"):
+            logger.error("窗口重置跳过：pyweixin 无 Navigator.open_seperate_dialog_window")
+            return {}
+        results: dict[str, bool] = {}
+        for chat in chat_names:
+            try:
+                ok = self._reset_one_window(nav, chat)
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("窗口重置异常 chat=%s: %s", chat, exc)
+                ok = False
+            if ok is not None:
+                results[chat] = ok
+        return results
+
+    def _reset_one_window(self, nav: Any, chat: str) -> bool | None:
+        win = self._dialogs.get(chat)
+        hwnd = _window_hwnd(win)
+        if not hwnd or not _hwnd_alive(hwnd):
+            win = self._find_existing_chat_window(chat)
+            hwnd = _window_hwnd(win)
+        if not hwnd:
+            logger.info("窗口重置跳过（未开窗）chat=%s", chat)
+            return None
+
+        rect = _hwnd_rect(hwnd)
+        topmost = _hwnd_is_topmost(hwnd)
+        _close_hwnd(hwnd)
+        deadline = time.monotonic() + 5
+        while _hwnd_alive(hwnd) and time.monotonic() < deadline:
+            time.sleep(0.2)
+        if _hwnd_alive(hwnd):
+            logger.error("窗口重置失败：旧窗口关不掉 chat=%s", chat)
+            return False
+
+        self._forget_chat_state(chat, hwnd)
+        pos = _cursor_pos()
+        try:
+            opened = nav.open_seperate_dialog_window(
+                friend=chat, window_minimize=True, close_weixin=False
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.error("窗口重置失败：重新打开群窗口出错 chat=%s err=%s", chat, exc)
+            return False
+        finally:
+            _restore_cursor(pos)
+
+        time.sleep(1.0)
+        found = self._find_existing_chat_window(chat)
+        new_win = found if found is not None else opened
+        new_hwnd = _window_hwnd(new_win)
+        if not new_hwnd:
+            logger.error("窗口重置失败：重新打开后找不到群窗口 chat=%s", chat)
+            return False
+        _restore_hwnd_placement(new_hwnd, rect, topmost)
+        if topmost and not _hwnd_is_topmost(new_hwnd):
+            time.sleep(0.5)
+            _restore_hwnd_placement(new_hwnd, rect, topmost)
+            if not _hwnd_is_topmost(new_hwnd):
+                logger.error(
+                    "窗口已重开但置顶未恢复 chat=%s，请手动点图钉置顶，否则可能听不到该群",
+                    chat,
+                )
+        self._dialogs[chat] = new_win
+        logger.info(
+            "窗口重置完成 chat=%s hwnd=%s->%s topmost=%s", chat, hwnd, new_hwnd, topmost
+        )
+        return True
+
+    def _forget_chat_state(self, chat: str, old_hwnd: int | None = None) -> None:
+        """窗口重建后清掉与旧窗口绑定的状态；下一轮重新暖机（跳过历史）。"""
+        self._dialogs.pop(chat, None)
+        self._list_cache.pop(chat, None)
+        self._last_snapshot.pop(chat, None)
+        self._warmed.discard(chat)
+        self._missing_warned.discard(chat)
+        if old_hwnd:
+            self._hwnd_names.pop(old_hwnd, None)
+
+    def _window_name_cached(self, win: Any) -> str:
+        """同一句柄的会话名不变，缓存起来；避免每 30 秒遍历整窗控件树。"""
+        hwnd = _window_hwnd(win)
+        if hwnd and hwnd in self._hwnd_names:
+            return self._hwnd_names[hwnd]
+        name = self._chat_window_display_name(win)
+        if hwnd and name:
+            self._hwnd_names[hwnd] = name
+        return name
+
+    def _prune_hwnd_names(self, alive: set[int]) -> None:
+        for h in list(self._hwnd_names):
+            if h not in alive:
+                self._hwnd_names.pop(h, None)
+
     def _chat_window_display_name(self, win: Any) -> str:
         """
         解析独立聊天窗的真实会话名。
@@ -1840,7 +1972,7 @@ class PyWeixinAdapter:
                     or "mmui::" in cls
                 ):
                     continue
-                name = self._chat_window_display_name(w)
+                name = self._window_name_cached(w)
                 if not name:
                     continue
                 if not (
@@ -1891,55 +2023,28 @@ class PyWeixinAdapter:
             known = list(load_room_nicks(chat_name) or [])
         if my_alias and my_alias not in known:
             known.append(my_alias)
+
+        # 优先用缓存的消息 List：win.descendants() 会遍历整窗（含全部历史气泡），
+        # 窗口开得越久越慢，是 CPU 随时间升高的主因之一。
+        if chat_name:
+            cached = self._cached_message_list(chat_name)
+            if cached is not None:
+                seen_before = self._last_read_items
+                rows = self._rows_from_message_list(cached, win, known, my_alias)
+                if rows or self._last_read_items > seen_before:
+                    # 有气泡就说明 List 仍有效（末尾可能恰好全是回执/系统消息）
+                    return rows
+                # 缓存的 List 一条气泡都读不到（窗口重建等）→ 作废后全量找一次
+                self._list_cache.pop(chat_name, None)
+
+        self._last_read_full_scan = True
         try:
             lists = win.descendants(control_type="List")
         except Exception:  # noqa: BLE001
             return best
+        best_list: Any | None = None
         for lst in lists:
-            rows: list[tuple[Any, str, str, str, str]] = []
-            try:
-                children = lst.children(control_type="ListItem")
-            except Exception:  # noqa: BLE001
-                continue
-            for item in children:
-                sender, content, ui_time = _parse_list_item_message(item)
-                if not content or is_bot_receipt_text(content):
-                    continue
-                if content.startswith("你已添加了") or "拍了拍" in content:
-                    continue
-                # 未在已知昵称里的「发送人」多半是脏数据，降级为未知
-                if sender and sender != "未知发送人":
-                    if not is_plausible_group_nickname(sender):
-                        sender = "未知发送人"
-                    elif known:
-                        keys = {nickname_match_key(k) for k in known if k}
-                        if sender not in known and nickname_match_key(sender) not in keys:
-                            # 允许精确/key 命中已知绑定；否则丢掉（防上条误贴）
-                            hit = match_text_to_candidates(sender, known)
-                            sender = hit if hit else "未知发送人"
-                if known and (not sender or sender == "未知发送人"):
-                    # 仅当 item 文本以某已知昵称开头时才认（避免正文误匹配）
-                    try:
-                        raw_item = (
-                            item.window_text() or item.element_info.name or ""
-                        ).strip()
-                    except Exception:  # noqa: BLE001
-                        raw_item = ""
-                    for nick in sorted(known, key=len, reverse=True):
-                        n = normalize_group_nickname(nick) or nick
-                        if not n:
-                            continue
-                        if raw_item == n or raw_item.startswith(n + "\n") or raw_item.startswith(
-                            n + " "
-                        ):
-                            sender = n
-                            break
-                if (not sender or sender == "未知发送人") and my_alias:
-                    if _message_item_is_self(item, win):
-                        sender = my_alias
-                rows.append(
-                    (item, sender or "未知发送人", content, "文本", ui_time or "")
-                )
+            rows = self._rows_from_message_list(lst, win, known, my_alias)
             if not rows:
                 continue
             score = len(rows)
@@ -1952,7 +2057,71 @@ class PyWeixinAdapter:
             if score > best_score:
                 best_score = score
                 best = rows
+                best_list = lst
+        if chat_name and best_list is not None:
+            self._list_cache[chat_name] = (best_list, time.monotonic())
         return best
+
+    def _cached_message_list(self, chat_name: str) -> Any | None:
+        entry = self._list_cache.get(chat_name)
+        if entry is None:
+            return None
+        lst, cached_at = entry
+        if time.monotonic() - cached_at > self._list_cache_ttl:
+            self._list_cache.pop(chat_name, None)
+            return None
+        return lst
+
+    def _rows_from_message_list(
+        self, lst: Any, win: Any, known: list[str], my_alias: str
+    ) -> list[tuple[Any, str, str, str, str]]:
+        """解析一个 List 控件末尾的消息气泡（数量由 WECHAT_TAIL_ITEMS 控制）。"""
+        rows: list[tuple[Any, str, str, str, str]] = []
+        try:
+            children = _tail_list_items(lst, self._tail_items)
+        except Exception:  # noqa: BLE001
+            return rows
+        self._last_read_items += len(children)
+        for item in children:
+            sender, content, ui_time = _parse_list_item_message(item)
+            if not content or is_bot_receipt_text(content):
+                continue
+            if content.startswith("你已添加了") or "拍了拍" in content:
+                continue
+            # 未在已知昵称里的「发送人」多半是脏数据，降级为未知
+            if sender and sender != "未知发送人":
+                if not is_plausible_group_nickname(sender):
+                    sender = "未知发送人"
+                elif known:
+                    keys = {nickname_match_key(k) for k in known if k}
+                    if sender not in known and nickname_match_key(sender) not in keys:
+                        # 允许精确/key 命中已知绑定；否则丢掉（防上条误贴）
+                        hit = match_text_to_candidates(sender, known)
+                        sender = hit if hit else "未知发送人"
+            if known and (not sender or sender == "未知发送人"):
+                # 仅当 item 文本以某已知昵称开头时才认（避免正文误匹配）
+                try:
+                    raw_item = (
+                        item.window_text() or item.element_info.name or ""
+                    ).strip()
+                except Exception:  # noqa: BLE001
+                    raw_item = ""
+                for nick in sorted(known, key=len, reverse=True):
+                    n = normalize_group_nickname(nick) or nick
+                    if not n:
+                        continue
+                    if raw_item == n or raw_item.startswith(n + "\n") or raw_item.startswith(
+                        n + " "
+                    ):
+                        sender = n
+                        break
+            if (not sender or sender == "未知发送人") and my_alias:
+                if _message_item_is_self(item, win):
+                    sender = my_alias
+            rows.append(
+                (item, sender or "未知发送人", content, "文本", ui_time or "")
+            )
+        return rows
 
     def _poll_chat_search(self, pyweixin: Any, chat_name: str) -> list[RawMessage]:
         """仅当显式允许 search 模式时使用（会占用搜索框）。"""
@@ -2103,8 +2272,9 @@ class PyWeixinAdapter:
 
             # 有置顶则只听置顶；全无置顶则听全部独立小窗
             use = [x for x in singles if x[2]] or singles
+            self._prune_hwnd_names({h for _w, h, _t in singles})
             for w, handle, topmost in use:
-                name = self._chat_window_display_name(w)
+                name = self._window_name_cached(w)
                 if not name or name in {"主窗口", "微信", "Weixin", "WeChat"}:
                     continue
                 if classify_session_title(name) in {"noise", "system"}:
@@ -2117,6 +2287,9 @@ class PyWeixinAdapter:
                     "kind": "group",
                     "hwnd": handle,
                 }
+                if _window_hwnd(self._dialogs.get(name)) != handle:
+                    # 窗口换了（用户关掉重开）→ 缓存的 List 属于旧窗口
+                    self._list_cache.pop(name, None)
                 self._dialogs[name] = w
         except Exception as exc:  # noqa: BLE001
             logger.warning("扫描置顶聊天窗失败: %s", exc)
@@ -2588,6 +2761,48 @@ def _extract_ui_timestamp(texts: list[str]) -> str:
     return ""
 
 
+def _tail_list_items(lst: Any, n: int) -> list[Any]:
+    """
+    取消息 List 末尾 n 个 ListItem（按原顺序，最新在最后）。n<=0 时取全部。
+
+    优先用 UIA TreeWalker 从最后一个子节点往前走，开销与列表总长度无关；
+    walker 不可用时退回 children() 再切片（仍省去逐条解析的开销）。
+    """
+    if n <= 0:
+        return list(lst.children(control_type="ListItem"))
+    try:
+        items = _tail_list_items_walker(lst, n)
+        if items is not None:
+            return items
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("tree-walker tail failed, fallback children(): %s", exc)
+    return list(lst.children(control_type="ListItem"))[-n:]
+
+
+def _tail_list_items_walker(lst: Any, n: int) -> list[Any] | None:
+    from pywinauto.controls.uiawrapper import UIAWrapper  # type: ignore
+    from pywinauto.uia_defines import IUIA  # type: ignore
+    from pywinauto.uia_element_info import UIAElementInfo  # type: ignore
+
+    element = getattr(lst.element_info, "element", None)
+    if element is None:
+        return None
+    # 与 pywinauto children()（FindAll + TrueCondition）同一视图
+    walker = IUIA().iuia.RawViewWalker
+    out: list[Any] = []
+    node = walker.GetLastChildElement(element)
+    # 跳过非 ListItem 的兄弟节点，但最多走 4n 步防止异常结构下长时间遍历
+    steps = 0
+    while node and len(out) < n and steps < n * 4:
+        steps += 1
+        info = UIAElementInfo(node)
+        if info.control_type == "ListItem":
+            out.append(UIAWrapper(info))
+        node = walker.GetPreviousSiblingElement(node)
+    out.reverse()
+    return out
+
+
 def _parse_list_item_message(item: Any) -> tuple[str, str, str]:
     """从微信消息 ListItem 提取 (发送人, 内容, UI时间)。
 
@@ -2747,6 +2962,116 @@ def _window_hwnd(win: Any) -> int | None:
         return h if h else None
     except Exception:  # noqa: BLE001
         return None
+
+
+def _hwnd_alive(hwnd: int | None) -> bool:
+    if not hwnd:
+        return False
+    try:
+        import ctypes
+
+        return bool(ctypes.windll.user32.IsWindow(int(hwnd)))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _hwnd_is_topmost(hwnd: int) -> bool:
+    try:
+        import ctypes
+
+        ex = int(ctypes.windll.user32.GetWindowLongW(int(hwnd), _GWL_EXSTYLE))
+        return bool(ex & _WS_EX_TOPMOST)
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _hwnd_rect(hwnd: int) -> tuple[int, int, int, int] | None:
+    """窗口还原态的 (left, top, right, bottom)；最小化时也能拿到正常位置。"""
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class WINDOWPLACEMENT(ctypes.Structure):
+            _fields_ = [
+                ("length", wintypes.UINT),
+                ("flags", wintypes.UINT),
+                ("showCmd", wintypes.UINT),
+                ("ptMinPosition", wintypes.POINT),
+                ("ptMaxPosition", wintypes.POINT),
+                ("rcNormalPosition", wintypes.RECT),
+            ]
+
+        wp = WINDOWPLACEMENT()
+        wp.length = ctypes.sizeof(WINDOWPLACEMENT)
+        if not ctypes.windll.user32.GetWindowPlacement(int(hwnd), ctypes.byref(wp)):
+            return None
+        r = wp.rcNormalPosition
+        if r.right - r.left <= 0 or r.bottom - r.top <= 0:
+            return None
+        return int(r.left), int(r.top), int(r.right), int(r.bottom)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _close_hwnd(hwnd: int) -> None:
+    try:
+        import ctypes
+
+        wm_close = 0x0010
+        ctypes.windll.user32.PostMessageW(int(hwnd), wm_close, 0, 0)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _restore_hwnd_placement(
+    hwnd: int, rect: tuple[int, int, int, int] | None, topmost: bool
+) -> None:
+    """显示（不抢焦点）并恢复位置/大小/置顶。"""
+    try:
+        import ctypes
+
+        user32 = ctypes.windll.user32
+        sw_shownoactivate = 4
+        sw_restore = 9
+        if user32.IsIconic(int(hwnd)):
+            user32.ShowWindow(int(hwnd), sw_restore)
+        else:
+            user32.ShowWindow(int(hwnd), sw_shownoactivate)
+        hwnd_topmost, hwnd_notopmost = -1, -2
+        swp_noactivate, swp_showwindow = 0x0010, 0x0040
+        swp_nomove, swp_nosize = 0x0002, 0x0001
+        flags = swp_noactivate | swp_showwindow
+        if rect:
+            x, y = rect[0], rect[1]
+            w, h = rect[2] - rect[0], rect[3] - rect[1]
+        else:
+            x = y = w = h = 0
+            flags |= swp_nomove | swp_nosize
+        # 64 位下 HWND_TOPMOST(-1) 必须按指针宽度传，单独声明参数类型
+        from ctypes import wintypes
+
+        set_pos = ctypes.WinDLL("user32").SetWindowPos
+        set_pos.argtypes = [
+            wintypes.HWND,
+            wintypes.HWND,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            wintypes.UINT,
+        ]
+        set_pos.restype = wintypes.BOOL
+        set_pos(
+            wintypes.HWND(int(hwnd)),
+            wintypes.HWND(hwnd_topmost if topmost else hwnd_notopmost),
+            x,
+            y,
+            w,
+            h,
+            flags,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("恢复窗口位置/置顶失败 hwnd=%s: %s", hwnd, exc)
 
 
 def _window_ghost(win: Any) -> dict[str, int] | None:
