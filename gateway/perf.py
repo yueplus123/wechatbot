@@ -64,8 +64,16 @@ def apply_process_limits() -> None:
     if sys.platform != "win32":
         return
     import ctypes
+    from ctypes import wintypes
 
-    kernel32 = ctypes.windll.kernel32
+    # 64 位下句柄是指针宽度：必须声明参数/返回类型，否则伪句柄 -1 会被截断成无效句柄
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+    kernel32.GetCurrentProcess.argtypes = []
+    kernel32.SetPriorityClass.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    kernel32.SetPriorityClass.restype = wintypes.BOOL
+    kernel32.SetProcessAffinityMask.argtypes = [wintypes.HANDLE, ctypes.c_size_t]
+    kernel32.SetProcessAffinityMask.restype = wintypes.BOOL
     proc = kernel32.GetCurrentProcess()
 
     level = (os.getenv("WORKER_PRIORITY", "idle") or "idle").strip().lower()
@@ -75,15 +83,19 @@ def apply_process_limits() -> None:
     elif kernel32.SetPriorityClass(proc, cls):
         logger.info("worker priority=%s", level)
     else:
-        logger.warning("设置进程优先级失败 level=%s", level)
+        logger.warning(
+            "设置进程优先级失败 level=%s err=%s", level, ctypes.get_last_error()
+        )
 
     cores = env_int("WORKER_CPU_CORES", 0)
     mask = affinity_mask(cores, os.cpu_count() or 0)
     if mask:
-        if kernel32.SetProcessAffinityMask(proc, ctypes.c_size_t(mask)):
+        if kernel32.SetProcessAffinityMask(proc, mask):
             logger.info("worker cpu affinity: first %s core(s)", cores)
         else:
-            logger.warning("设置 CPU 亲和性失败 cores=%s", cores)
+            logger.warning(
+                "设置 CPU 亲和性失败 cores=%s err=%s", cores, ctypes.get_last_error()
+            )
 
 
 # ---------------------------------------------------------------- 系统 CPU 采样
