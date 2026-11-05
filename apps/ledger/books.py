@@ -360,8 +360,6 @@ def is_book_command_text(text: str, chat_name: str | None = None) -> bool:
         "清帳",
         "记账",
         "記賬",
-        "已转账",
-        "已轉賬",
         "查询usdt",
         "查詢usdt",
         "usdt查询",

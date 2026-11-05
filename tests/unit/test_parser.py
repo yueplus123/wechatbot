@@ -121,7 +121,7 @@ def test_staff_order_parse():
 
 
 def test_ledger_usdt_parse():
-    """USDT：给我6740，2000刀 → 欠款元 + 充值美金；查询usdt / 已转账。"""
+    """USDT：给我12467，1000刀 → 美金+1000、人民币12467；查询usdt；USDT 不清空。"""
     r = parse_command("给我6740，2000刀")
     assert r.status == ParseStatus.OK
     assert r.command == "ledger"
@@ -159,11 +159,14 @@ def test_ledger_usdt_parse():
     r = parse_command("usdt查询")
     assert r.command == "usdt_query"
 
-    r = parse_command("已转账")
-    assert r.command == "usdt_settlement_clear"
-    assert r.book == "usdt"
-    r = parse_command("清账usdt")
-    assert r.command == "usdt_settlement_clear"
+    # USDT 不存在清空
+    assert parse_command("已转账").status == ParseStatus.IGNORED
+    assert parse_command("清账usdt").status == ParseStatus.ERROR
+    assert parse_command("清空usdt").status == ParseStatus.ERROR
+
+    r = parse_command("给我12467，1000刀")
+    assert str(r.amount) == "1000.00" and r.currency == "USD"
+    assert str(r.amount_to_me) == "12467.00" and r.remark == "人民币12467.00"
 
     # 普通记账「给我」标签仍走项目名格式，不与 USDT 刀格式冲突
     r = parse_command("飞机号 金额50 给我50 利润10")
@@ -179,6 +182,8 @@ def test_usdt_success_template():
     entry = LedgerEntry(
         business_name="USDT",
         book=LedgerEntry.Book.USDT,
+        direction=LedgerEntry.Direction.INCOME,
+        amount=Decimal("2000.00"),
         receive_amount=Decimal("2000.00"),
         amount_to_me=Decimal("6740.00"),
     )
@@ -186,8 +191,8 @@ def test_usdt_success_template():
     assert body.startswith("记录成功\n")
     assert USDT_REPLY_SEP in body
     assert "┌─ 项目名：USDT" in body
-    assert "│ 充值金额：2000.00美金" in body
-    assert "└─ 欠款6740元" in body
+    assert "│ 美金：2000.00美金" in body
+    assert "└─ 人民币：6740元" in body
     assert "记录人：张越" in body
     assert "记录时间：" in body
     assert "收入：" not in body
@@ -480,5 +485,5 @@ def test_clear_all_by_employee():
     assert r.command == "staff_order_clear_employee" and r.remark == "张三"
     r = parse_command("清空-")
     assert r.status == ParseStatus.ERROR
-    # USDT 清账不受影响
-    assert parse_command("清空usdt").command == "usdt_settlement_clear"
+    # USDT 不支持清空，不会被当成「清空-姓名」
+    assert parse_command("清空usdt").status == ParseStatus.ERROR

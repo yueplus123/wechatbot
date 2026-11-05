@@ -486,22 +486,11 @@ def _parse_ledger_usdt(
     rule_version: str,
     normalized_override: str | None = None,
 ) -> ParseResult | None:
-    """USDT：给我欠款，刀数 ／ 查询usdt ／ 已转账。"""
+    """USDT：给我人民币数，美金数刀 ／ 查询usdt。USDT 没有清空，写入后一直显示。"""
     normalized = normalize_text(text)
     display = normalized_override or normalized
     if not normalized:
         return None
-
-    if normalized in {"已转账", "已轉賬"}:
-        return ParseResult(
-            status=ParseStatus.OK,
-            command="usdt_settlement_clear",
-            book="usdt",
-            business_name="USDT",
-            remark="USDT",
-            rule_version=rule_version,
-            normalized_text=display,
-        )
 
     if re.fullmatch(r"(查询|查詢)\s*usdt", normalized, flags=re.IGNORECASE) or re.fullmatch(
         r"usdt\s*(查询|查詢)", normalized, flags=re.IGNORECASE
@@ -516,21 +505,18 @@ def _parse_ledger_usdt(
             normalized_text=display,
         )
 
-    # 兼容旧清账口令
+    # USDT 不存在清空
     if re.fullmatch(r"(清账|清帳|清空)\s*usdt", normalized, flags=re.IGNORECASE) or re.fullmatch(
         r"usdt\s*(清账|清帳|清空)", normalized, flags=re.IGNORECASE
     ):
-        return ParseResult(
-            status=ParseStatus.OK,
-            command="usdt_settlement_clear",
-            book="usdt",
-            business_name="USDT",
-            remark="USDT",
-            rule_version=rule_version,
-            normalized_text=display,
+        return _err(
+            "E001",
+            "USDT 不支持清空，记录写入后一直保留。查看请发：查询usdt",
+            display,
+            rule_version,
         )
 
-    # 给我6740，2000刀 → 欠款 6740 元，充值 2000 美金
+    # 给我12467，1000刀 → USDT +1000 美金，人民币数 12467 元
     m = re.fullmatch(
         r"(给我|usdt)\s*(\d+(?:\.\d{1,2})?)\s*[，,]\s*([+-]?)(\d+(?:\.\d{1,2})?)\s*刀",
         normalized,
@@ -542,7 +528,7 @@ def _parse_ledger_usdt(
         if debt is None or amt is None:
             return _err(
                 "E002",
-                "格式：给我6740，2000刀（前面是欠款元，后面是美金刀数）",
+                "格式：给我12467，1000刀（前面是人民币数，后面是美金数）",
                 display,
                 rule_version,
             )
@@ -556,7 +542,7 @@ def _parse_ledger_usdt(
             amount=usd,
             currency="USD",
             category="其他",
-            remark=f"欠款{debt}",
+            remark=f"人民币{debt}",
             book="usdt",
             rule_version=rule_version,
             normalized_text=display,
@@ -567,7 +553,7 @@ def _parse_ledger_usdt(
             profit_amount=Decimal("0.00"),
         )
 
-    # 给我2000刀 → 仅美金，欠款 0
+    # 给我2000刀 → 仅美金，人民币数 0
     m = re.fullmatch(
         r"(给我|usdt)\s*([+-]?)(\d+(?:\.\d{1,2})?)\s*刀",
         normalized,
@@ -579,7 +565,7 @@ def _parse_ledger_usdt(
     if amt is None:
         return _err(
             "E002",
-            "格式：给我6740，2000刀（前面是欠款元，后面是美金刀数）",
+            "格式：给我12467，1000刀（前面是人民币数，后面是美金数）",
             display,
             rule_version,
         )

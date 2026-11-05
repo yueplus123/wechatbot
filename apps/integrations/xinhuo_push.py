@@ -119,6 +119,14 @@ def build_ledger_payload(entry: "LedgerEntry") -> dict | None:
     }
 
 
+def _usdt_signed_usd(entry: "LedgerEntry") -> Decimal:
+    """USDT 美金数：给我…，-1000刀（EXPENSE）推负数，避免薪火显示成 +1000。"""
+    usd = Decimal(entry.amount or 0)
+    if (entry.direction or "").upper() == "EXPENSE":
+        return -abs(usd)
+    return abs(usd)
+
+
 def build_bot_record_payload(entry: "LedgerEntry") -> dict | None:
     """员工记单 / USDT → 薪火 WechatBotRecord（微信BOT数据）。"""
     book = (entry.book or "").strip()
@@ -145,7 +153,7 @@ def build_bot_record_payload(entry: "LedgerEntry") -> dict | None:
             "quantity": 0,
             "amount": str(entry.amount_to_me or 0),
             "amount_cny": str(entry.amount_to_me or 0),
-            "amount_usd": str(entry.receive_amount or entry.amount or 0),
+            "amount_usd": str(_usdt_signed_usd(entry)),
             "currency": "USD",
             "business_name": "USDT",
             "amount_to_you": str(entry.amount_to_you or 0),
@@ -582,6 +590,57 @@ def pull_bot_records_from_xinhuo(
         "ok": True,
         "count": int(r.data.get("count") or len(records)),
         "records": records,
+    }
+
+
+# 薪火 table_type → 机器人规范业务名（查询分组用；薪火手工录入的记录也能归到正确业务）
+TABLE_TYPE_TO_BIZ: dict[str, str] = {
+    "pixivcoban": "充币",
+    "once_card": "一次卡",
+    "shared": "共享",
+    "package": "打包",
+    "openrouter": "openrouter",
+    "patreon": "patreon",
+    "commission": "约稿",
+    "booth": "booth",
+    "pictspace": "pictspace",
+    "remote": "远程",
+    "premium": "高级会员",
+    "mega": "mega",
+    "chatgpt": "gpt",
+    "usdt": "USDT",
+}
+
+
+def clear_bot_records_on_xinhuo(
+    *, employee_name: str, business_name: str = ""
+) -> dict | None:
+    """在薪火侧清空该员工未清空记单（action=clear）。失败返回 None。USDT 永不清空。"""
+    emp = (employee_name or "").strip()
+    if not emp:
+        return None
+    payload: dict[str, str] = {"action": "clear", "employee_name": emp}
+    biz = (business_name or "").strip()
+    if biz:
+        tt = resolve_bot_table_type(biz)
+        if not tt:
+            return None
+        payload["table_type"] = tt
+    r = get_bridge().bot_record_post(
+        payload, log_label=f"bot_clear emp={emp} biz={biz or '*'}"
+    )
+    if not r.ok or not isinstance(r.data, dict) or not r.data.get("ok"):
+        logger.warning(
+            "xinhuo bot clear failed status=%s err=%s body=%s",
+            r.status_code,
+            r.error,
+            (r.text or "")[:200],
+        )
+        return None
+    return {
+        "cleared": int(r.data.get("cleared") or 0),
+        "by_table": dict(r.data.get("by_table") or {}),
+        "event_ids": list(r.data.get("event_ids") or []),
     }
 
 

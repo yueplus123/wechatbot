@@ -90,11 +90,9 @@ DEFAULT_KEYWORDS: list[tuple[str, str, list[str]]] = [
         "usdt",
         LedgerEntry.Book.USDT,
         [
-            "给我6740，2000刀",
+            "给我12467，1000刀",
             "给我2000刀",
             "查询usdt",
-            "已转账",
-            "清账usdt",
         ],
     ),
 ]
@@ -254,11 +252,9 @@ def ensure_default_keywords(*, refresh: bool = False) -> tuple[int, int]:
                 staff_usdt_kw.book = LedgerEntry.Book.USDT
                 staff_usdt_kw.set_usage_list(
                     [
-                        "给我6740，2000刀",
+                        "给我12467，1000刀",
                         "给我2000刀",
                         "查询usdt",
-                        "已转账",
-                        "清账usdt",
                     ]
                 )
                 staff_usdt_kw.save()

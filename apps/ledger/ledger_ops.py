@@ -29,7 +29,7 @@ REPLY_COMMAND_FOOTER = """📒 指令说明
 • 例：飞机号 给我50
 【查询】未清账按业务汇总：查询记账
 【清账】未清账全部标记已清账：清账
-（USDT：给我6740，2000刀 ／ 查询usdt ／ 已转账）
+（USDT：给我12467，1000刀 → 美金+1000、人民币12467 ／ 查询usdt；USDT 不清空）
 【统计】查询本月 / 查询上月 / 查询本周
 【记单】业务名+数量 / 业务名-数量（例：充币+1）
 • 查询单项：查询业务名-姓名（例：查询充币-李振宇）
@@ -63,7 +63,7 @@ def fmt_money(amount, currency: str = "CNY") -> str:
 
 
 def fmt_debt_yuan(amount) -> str:
-    """欠款展示：6740元（整数不带小数）。"""
+    """人民币展示：12467元（整数不带小数）。"""
     a = Decimal(amount or 0).quantize(Decimal("0.01"))
     if a == a.to_integral_value():
         return f"{int(a)}元"
@@ -260,11 +260,11 @@ def ledger_entry_success_reply(
     )
 
 
-def _usdt_project_block(usd_amount, debt_cny) -> str:
+def _usdt_project_block(usd_amount, cny_amount) -> str:
     return (
         f"┌─ 项目名：USDT\n"
-        f"│ 充值金额：{fmt_money(usd_amount, 'USD')}\n"
-        f"└─ 欠款{fmt_debt_yuan(debt_cny)}"
+        f"│ 美金：{fmt_money(usd_amount, 'USD')}\n"
+        f"└─ 人民币：{fmt_debt_yuan(cny_amount)}"
     )
 
 
@@ -280,7 +280,9 @@ def usdt_entry_success_reply(
     usd = Decimal("0")
     debt = Decimal("0")
     if entry is not None:
-        usd = entry.receive_amount or Decimal("0")
+        usd = Decimal(entry.amount or 0)
+        if entry.direction == LedgerEntry.Direction.EXPENSE:
+            usd = -abs(usd)
         debt = entry.amount_to_me or Decimal("0")
         if not who:
             who = (getattr(getattr(entry, "employee", None), "display_name", None) or "") or ""
@@ -294,49 +296,60 @@ def usdt_entry_success_reply(
     )
 
 
+USDT_QUERY_MAX_ROWS = 30
+
+
 def format_usdt_query(room) -> str:
-    """查询usdt：全部未清账（跨群），不区分人员。"""
+    """查询usdt：以薪火「微信BOT数据·USDT」为准（全部记录，USDT 不清空）。"""
     _ = room
-    qs = list(
-        LedgerEntry.objects.filter(
-            book=LedgerEntry.Book.USDT,
-            status=LedgerEntry.Status.ACTIVE,
-        )
-        .select_related("employee")
-        .order_by("occurred_at", "id")
-    )
-    if not qs:
-        qs = list(
-            LedgerEntry.objects.filter(
-                book=LEDGER_BOOK,
-                business_name__iexact="USDT",
-                status=LedgerEntry.Status.ACTIVE,
-            )
-            .select_related("employee")
-            .order_by("occurred_at", "id")
-        )
     now = timezone.now()
+    try:
+        from apps.integrations.xinhuo_push import pull_bot_records_from_xinhuo
+
+        data = pull_bot_records_from_xinhuo(business_name="USDT", status="*")
+    except Exception:
+        data = None
+    if data is None:
+        return ledger_error_reply("⚠️ 薪火暂时连不上，查询失败，请稍后再试。")
+
+    rows = [
+        r
+        for r in (data.get("records") or [])
+        if str(r.get("table_type") or "").lower() == "usdt"
+    ]
     parts = ["USDT查询", USDT_REPLY_SEP]
-    if not qs:
-        parts.append("暂无未清账记录")
+    if not rows:
+        parts.append("暂无记录")
         parts.append(USDT_REPLY_SEP)
         parts.append(f"查询时间：{fmt_ts(now)}")
         return "\n".join(parts)
 
-    total_usd = Decimal("0")
-    total_debt = Decimal("0")
-    for e in qs:
-        usd = e.receive_amount or Decimal("0")
-        debt = e.amount_to_me or Decimal("0")
-        total_usd += usd
-        total_debt += debt
-        who = (getattr(getattr(e, "employee", None), "display_name", None) or "") or "—"
-        parts.append(_usdt_project_block(usd, debt))
-        parts.append(f"记录人：{who}")
-        parts.append(f"记录时间：{fmt_ts(e.occurred_at)}")
+    def _dec(v) -> Decimal:
+        try:
+            return Decimal(str(v if v not in (None, "") else 0))
+        except Exception:
+            return Decimal("0")
+
+    total_usd = sum((_dec(r.get("amount_usd")) for r in rows), Decimal("0"))
+    total_cny = sum(
+        (_dec(r.get("amount_cny", r.get("amount"))) for r in rows), Decimal("0")
+    )
+    shown = rows[-USDT_QUERY_MAX_ROWS:]
+    if len(rows) > len(shown):
+        parts.append(f"共{len(rows)}条，仅显示最近{len(shown)}条")
         parts.append(USDT_REPLY_SEP)
-    parts.append(f"合计充值金额：{fmt_money(total_usd, 'USD')}")
-    parts.append(f"合计欠款{fmt_debt_yuan(total_debt)}")
+    for r in shown:
+        parts.append(
+            _usdt_project_block(
+                _dec(r.get("amount_usd")), _dec(r.get("amount_cny", r.get("amount")))
+            )
+        )
+        parts.append(f"记录人：{(str(r.get('employee_name') or '')).strip() or '—'}")
+        dt = parse_remote_datetime(r.get("occurred_at"))
+        parts.append(f"记录时间：{fmt_ts(dt) if dt else '—'}")
+        parts.append(USDT_REPLY_SEP)
+    parts.append(f"合计美金：{fmt_money(total_usd, 'USD')}")
+    parts.append(f"合计人民币：{fmt_debt_yuan(total_cny)}")
     parts.append(USDT_REPLY_SEP)
     parts.append(f"查询时间：{fmt_ts(now)}")
     return "\n".join(parts)
@@ -384,8 +397,11 @@ LEDGER_HELP_TEXT = (
     f"{REPLY_SEP}\n"
     f"入账：业务名 金额N 给你N 给我N 利润N（至少写一个）\n"
     f"例：充币金额214给你147利润67\n"
-    f"USDT：给我6740，2000刀 ／ 查询usdt ／ 已转账\n"
+    f"USDT：给我12467，1000刀（美金+1000，人民币12467）／ 查询usdt（USDT 不清空）\n"
     f"查询记账 · 清账 · 查询本月/上月/本周\n"
+    f"{REPLY_SEP}\n"
+    f"记单：业务名+1 ／ 查询业务名-姓名 ／ 清空业务名-姓名\n"
+    f"全部：查询-姓名 ／ 清空-姓名（清空仅管理员）\n"
     f"{REPLY_SEP}\n"
     f"{fmt_ts()}"
 )
@@ -777,74 +793,6 @@ def clear_settlements(room, employee=None, *, event=None) -> str:
         count=count,
         range_text=range_text,
         when=when,
-    )
-
-
-def clear_usdt_settlements(room, employee=None, *, event=None) -> str:
-    """USDT 清账：全部未清账的 USDT 记录 → 已清账（跨群）。"""
-    _ = event
-    _ = room
-    try:
-        from apps.chatrooms.models import ChatRoom
-        from apps.integrations.xinhuo_push import sync_room_ledger_from_xinhuo
-
-        for r in ChatRoom.objects.filter(enabled=True):
-            try:
-                sync_room_ledger_from_xinhuo(r)
-            except Exception:
-                continue
-    except Exception:
-        pass
-
-    qs = LedgerEntry.objects.filter(
-        book=LedgerEntry.Book.USDT,
-        status=LedgerEntry.Status.ACTIVE,
-    ).order_by("occurred_at", "id")
-    if not qs.exists():
-        qs = LedgerEntry.objects.filter(
-            book=LEDGER_BOOK,
-            business_name__iexact="USDT",
-            status=LedgerEntry.Status.ACTIVE,
-        ).order_by("occurred_at", "id")
-    entries = list(qs)
-    who = (employee.display_name if employee else "") or "操作人"
-    if not entries:
-        return (
-            f"已转账\n"
-            f"{USDT_REPLY_SEP}\n"
-            f"没有未清账的 USDT 记录\n"
-            f"{USDT_REPLY_SEP}\n"
-            f"操作人：{who}\n"
-            f"时间：{fmt_ts()}"
-        )
-
-    count = len(entries)
-    total_usd = sum((e.receive_amount or Decimal("0") for e in entries), Decimal("0"))
-    total_debt = sum((e.amount_to_me or Decimal("0") for e in entries), Decimal("0"))
-    when = timezone.now()
-    qs.update(
-        status=LedgerEntry.Status.PROCESSED,
-        reverse_reason=f"已转账 by {who}",
-        reversed_at=when,
-        updated_at=when,
-    )
-    try:
-        from apps.integrations.xinhuo_push import schedule_push_status
-
-        for e in entries:
-            e.status = LedgerEntry.Status.PROCESSED
-            schedule_push_status(e)
-    except Exception:
-        pass
-    return (
-        f"已转账\n"
-        f"{USDT_REPLY_SEP}\n"
-        f"已将 {count} 条未清账改为已清账\n"
-        f"充值金额：{fmt_money(total_usd, 'USD')}\n"
-        f"欠款{fmt_debt_yuan(total_debt)}\n"
-        f"{USDT_REPLY_SEP}\n"
-        f"操作人：{who}\n"
-        f"时间：{fmt_ts(when)}"
     )
 
 

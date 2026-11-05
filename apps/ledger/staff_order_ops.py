@@ -353,78 +353,119 @@ def _remote_variant_label(rec: dict, business_name: str) -> str:
     return biz or "未命名"
 
 
-def format_staff_order_query_by_employee(room, target_employee) -> str:
-    """查询-姓名 → 该备注名各业务合计（优先薪火微信BOT数据，跨群）。"""
+XINHUO_DOWN_MSG = "⚠️ 薪火暂时连不上，{what}失败，请稍后再试（本次未做任何改动）。"
+
+
+def _remote_biz_variant(rec: dict) -> tuple[str, str]:
+    """薪火记录 → (规范业务名, 规格)。按 table_type 归类，薪火手工录入的记录也能对上。"""
+    from apps.integrations.xinhuo_push import TABLE_TYPE_TO_BIZ
     from apps.ledger.staff_order_catalog import is_multi_sku
 
-    _ = room
-    when = timezone.now()
-    name = (getattr(target_employee, "display_name", None) or "").strip() or "—"
+    tt = str(rec.get("table_type") or "").strip().lower()
+    bn = str(rec.get("business_name") or "").strip()
+    biz = TABLE_TYPE_TO_BIZ.get(tt) or bn or str(rec.get("book") or "").strip() or "未命名"
+    if is_multi_sku(biz):
+        return biz, (bn if bn and bn != biz else biz)
+    return biz, biz
 
-    remote_rows: list[dict] | None = None
+
+def _pull_remote(employee_name: str, business_name: str = "") -> list[dict] | None:
+    """拉取薪火未清空记单（不含 USDT）。失败返回 None。"""
     try:
         from apps.integrations.xinhuo_push import pull_bot_records_from_xinhuo
 
-        data = pull_bot_records_from_xinhuo(employee_name=name, status="ACTIVE")
-        if data is not None:
-            remote_rows = list(data.get("records") or [])
+        data = pull_bot_records_from_xinhuo(
+            employee_name=employee_name,
+            business_name=business_name,
+            status="ACTIVE",
+        )
     except Exception:
-        remote_rows = None
+        return None
+    if data is None:
+        return None
+    rows = []
+    for r in data.get("records") or []:
+        if str(r.get("table_type") or "").lower() == "usdt":
+            continue
+        rows.append(r)
+    return rows
+
+
+def remote_self_net(entry: LedgerEntry, *, sku_remark: str = "") -> Decimal | None:
+    """记单成功回执的「本人合计」：薪火未清空合计 + 本条（本条可能还没推到薪火）。"""
+    from apps.integrations.xinhuo_push import entry_event_id
+    from apps.ledger.staff_order_catalog import is_multi_sku
+
+    name = (getattr(entry.employee, "display_name", None) or "").strip()
+    biz = (entry.business_name or "").strip()
+    rows = _pull_remote(name, biz)
+    if rows is None:
+        return None
+    this_id = entry_event_id(entry)
+    total = Decimal("0")
+    for r in rows:
+        if str(r.get("event_id") or r.get("external_id") or "") == this_id:
+            continue
+        rb, variant = _remote_biz_variant(r)
+        if rb != biz:
+            continue
+        if is_multi_sku(biz) and sku_remark and variant != sku_remark:
+            continue
+        total += _qty_from_remote(r)
+    return (total + entry_delta(entry)).quantize(Decimal("0.01"))
+
+
+def _mark_local_processed(entries: list[LedgerEntry], reason: str, when) -> None:
+    if not entries:
+        return
+    LedgerEntry.objects.filter(id__in=[e.id for e in entries]).update(
+        status=LedgerEntry.Status.PROCESSED,
+        reverse_reason=reason[:255],
+        reversed_at=when,
+        updated_at=when,
+    )
+
+
+def format_staff_order_query_by_employee(room, target_employee) -> str:
+    """查询-姓名 → 该员工所有未清空记单（以薪火为准，跨群）。"""
+    from apps.ledger.ledger_ops import ledger_error_reply
+    from apps.ledger.staff_order_catalog import is_multi_sku
+
+    _ = room
+    name = (getattr(target_employee, "display_name", None) or "").strip() or "—"
+    rows = _pull_remote(name)
+    if rows is None:
+        return ledger_error_reply(XINHUO_DOWN_MSG.format(what="查询"))
 
     nested: dict[str, dict[str, Decimal]] = defaultdict(
         lambda: defaultdict(lambda: Decimal("0"))
     )
-    if remote_rows is not None:
-        for r in remote_rows:
-            biz = (str(r.get("business_name") or r.get("book") or "")).strip() or "未命名"
-            if (biz or "").upper() == "USDT" or str(r.get("table_type") or "") == "usdt":
-                continue
-            if is_multi_sku(biz):
-                label = _remote_variant_label(r, biz)
-            else:
-                label = biz
-            nested[biz][label] += _qty_from_remote(r)
-    else:
-        for e in _load_active_by_display_name(name):
-            biz = (e.business_name or "").strip() or "未命名"
-            if is_multi_sku(biz):
-                label = _entry_variant_label(e, biz)
-            else:
-                label = biz
-            nested[biz][label] += entry_delta(e)
+    for r in rows:
+        biz, variant = _remote_biz_variant(r)
+        nested[biz][variant] += _qty_from_remote(r)
 
-    parts = [
-        "记单查询",
-        f"员工：{name}",
-        REPLY_SEP,
-    ]
+    parts = ["记单查询", f"员工：{name}", REPLY_SEP]
     if not nested:
-        parts.append("暂无记录")
-        parts.append(REPLY_SEP)
-        total = Decimal("0")
+        parts += ["暂无记录", REPLY_SEP]
     else:
         total = Decimal("0")
         for biz in sorted(nested.keys()):
-            variants_map = nested[biz]
+            vm = nested[biz]
             if is_multi_sku(biz):
-                items = [
-                    (lab, net.quantize(Decimal("0.01")))
-                    for lab, net in variants_map.items()
-                ]
-                items = _sort_variant_items(items, biz)
+                items = _sort_variant_items(
+                    [(k, v.quantize(Decimal("0.01"))) for k, v in vm.items()], biz
+                )
                 sub = sum((n for _, n in items), Decimal("0")).quantize(Decimal("0.01"))
                 total += sub
                 parts.append(f"{biz}：{fmt_orders(sub)}")
                 for lab, net in items:
                     parts.append(f"  · {lab}：{fmt_orders(net)}")
             else:
-                net = sum(variants_map.values(), Decimal("0")).quantize(Decimal("0.01"))
+                net = sum(vm.values(), Decimal("0")).quantize(Decimal("0.01"))
                 total += net
                 parts.append(f"{biz}：{fmt_orders(net)}")
-        parts.append(REPLY_SEP)
-        parts.append(f"合计：{fmt_orders(total.quantize(Decimal('0.01')))}")
-        parts.append(REPLY_SEP)
-    parts.append(f"查询时间：{fmt_ts(when)}")
+        parts += [REPLY_SEP, f"合计：{fmt_orders(total.quantize(Decimal('0.01')))}", REPLY_SEP]
+    parts.append(f"查询时间：{fmt_ts()}")
     return "\n".join(parts)
 
 
@@ -441,100 +482,38 @@ def format_staff_order_query(
         is_admin = bool(is_admin)
 
     if target_employee is not None:
+        from apps.ledger.ledger_ops import ledger_error_reply
+
         person = (getattr(target_employee, "display_name", None) or "").strip() or "—"
-
-        remote_rows: list[dict] | None = None
-        try:
-            from apps.integrations.xinhuo_push import pull_bot_records_from_xinhuo
-
-            data = pull_bot_records_from_xinhuo(
-                employee_name=person,
-                business_name=business_name,
-                status="ACTIVE",
-            )
-            if data is not None:
-                remote_rows = list(data.get("records") or [])
-        except Exception:
-            remote_rows = None
-
-        if remote_rows is not None:
-            qty_list = [_qty_from_remote(r) for r in remote_rows]
-            total = sum(qty_list, Decimal("0")).quantize(Decimal("0.01"))
-
-            if is_multi_sku(business_name):
-                buckets: dict[str, Decimal] = defaultdict(lambda: Decimal("0"))
-                for r in remote_rows:
-                    buckets[_remote_variant_label(r, business_name)] += _qty_from_remote(r)
-                variants = [
-                    (label, net.quantize(Decimal("0.01")))
-                    for label, net in buckets.items()
-                ]
-                variants = _sort_variant_items(variants, business_name)
-                return staff_order_query_variants_reply(
-                    business_name=business_name,
-                    person_name=person,
-                    variants=variants,
-                    total_net=total,
-                )
-
-            parts = [
-                "记单查询",
-                f"业务名：{business_name}",
-                f"员工：{person}",
-                REPLY_SEP,
-            ]
-            if not remote_rows:
-                parts.append("暂无记录")
-                parts.append(REPLY_SEP)
-            else:
-                for r in remote_rows:
-                    ts = _occurred_ts_from_remote(r) or "—"
-                    parts.append(f"{ts}  {fmt_signed_orders(_qty_from_remote(r))}")
-                parts.append(REPLY_SEP)
-                parts.append(f"合计：{fmt_orders(total)}（{len(remote_rows)}笔）")
-                parts.append(REPLY_SEP)
-            parts.append(f"查询时间：{fmt_ts()}")
-            return "\n".join(parts)
-
-        # 薪火不可用时本地兜底
-        mine = _load_active_by_display_name(person, business_name=business_name)
-        total = sum((entry_delta(x) for x in mine), Decimal("0")).quantize(
+        rows = _pull_remote(person, business_name)
+        if rows is None:
+            return ledger_error_reply(XINHUO_DOWN_MSG.format(what="查询"))
+        rows = [r for r in rows if _remote_biz_variant(r)[0] == business_name]
+        total = sum((_qty_from_remote(r) for r in rows), Decimal("0")).quantize(
             Decimal("0.01")
         )
-
         if is_multi_sku(business_name):
-            buckets = defaultdict(lambda: Decimal("0"))
-            for e in mine:
-                buckets[_entry_variant_label(e, business_name)] += entry_delta(e)
-            variants = [
-                (label, net.quantize(Decimal("0.01")))
-                for label, net in buckets.items()
-            ]
-            variants = _sort_variant_items(variants, business_name)
+            buckets: dict[str, Decimal] = defaultdict(lambda: Decimal("0"))
+            for r in rows:
+                buckets[_remote_biz_variant(r)[1]] += _qty_from_remote(r)
+            variants = _sort_variant_items(
+                [(k, v.quantize(Decimal("0.01"))) for k, v in buckets.items()],
+                business_name,
+            )
             return staff_order_query_variants_reply(
                 business_name=business_name,
                 person_name=person,
                 variants=variants,
                 total_net=total,
             )
-
-        parts = [
-            "记单查询",
-            f"业务名：{business_name}",
-            f"员工：{person}",
-            REPLY_SEP,
-        ]
-        if not mine:
-            parts.append("暂无记录")
-            parts.append(REPLY_SEP)
+        parts = ["记单查询", f"业务名：{business_name}", f"员工：{person}", REPLY_SEP]
+        if not rows:
+            parts += ["暂无记录", REPLY_SEP]
         else:
-            for e in mine:
-                parts.append(
-                    f"{fmt_ts(e.occurred_at)}  {fmt_signed_orders(entry_delta(e))}"
-                )
-            parts.append(REPLY_SEP)
-            parts.append(f"合计：{fmt_orders(total)}（{len(mine)}笔）")
-            parts.append(REPLY_SEP)
+            for r in rows:
+                ts = _occurred_ts_from_remote(r) or "—"
+                parts.append(f"{ts}  {fmt_signed_orders(_qty_from_remote(r))}")
+            parts += [REPLY_SEP, f"合计：{fmt_orders(total)}（{len(rows)}笔）", REPLY_SEP]
         parts.append(f"查询时间：{fmt_ts()}")
         return "\n".join(parts)
 
@@ -586,39 +565,33 @@ def clear_staff_order_business(
     *,
     target_employee=None,
 ) -> str:
-    """清空指定业务；按统一备注名跨群清空该员工，不清全员。"""
+    """清空业务-姓名：先在薪火清空该员工该业务（含薪火手工录入的），再同步本机。"""
+    from apps.integrations.xinhuo_push import clear_bot_records_on_xinhuo
     from apps.ledger.ledger_ops import ledger_error_reply
 
     _ = room
     if target_employee is None:
-        return ledger_error_reply(
-            f"❌ 清空需指定员工。例：清空{business_name}-张越"
-        )
+        return ledger_error_reply(f"❌ 清空需指定员工。例：清空{business_name}-张越")
 
     target_name = (getattr(target_employee, "display_name", None) or "").strip() or "—"
-    entries = _load_active_by_display_name(target_name, business_name=business_name)
-    count = len(entries)
+    result = clear_bot_records_on_xinhuo(
+        employee_name=target_name, business_name=business_name
+    )
+    if result is None:
+        return ledger_error_reply(XINHUO_DOWN_MSG.format(what="清空"))
+
+    who = (employee.display_name if employee else "") or "操作人"
+    when = timezone.now()
+    _mark_local_processed(
+        _load_active_by_display_name(target_name, business_name=business_name),
+        f"清空记单 {business_name}/{target_name} by {who}",
+        when,
+    )
+    count = int(result.get("cleared") or 0)
     if count == 0:
         return ledger_error_reply(
             f"ℹ️ 「{target_name}」在「{business_name}」没有可清空的记单"
         )
-    who = (employee.display_name if employee else "") or "操作人"
-    when = timezone.now()
-    ids = [e.id for e in entries]
-    LedgerEntry.objects.filter(id__in=ids).update(
-        status=LedgerEntry.Status.PROCESSED,
-        reverse_reason=f"清空记单 {business_name}/{target_name} by {who}",
-        reversed_at=when,
-        updated_at=when,
-    )
-    try:
-        from apps.integrations.xinhuo_push import schedule_push_status
-
-        for e in entries:
-            e.status = LedgerEntry.Status.PROCESSED
-            schedule_push_status(e)
-    except Exception:
-        pass
     return staff_order_clear_reply(
         business_name=business_name,
         count=count,
@@ -629,46 +602,35 @@ def clear_staff_order_business(
 
 
 def clear_staff_order_by_employee(room, employee, *, target_employee) -> str:
-    """清空-姓名：按统一备注名跨群清空该员工全部业务的未清空记单（不含 USDT / 记账）。"""
+    """清空-姓名：在薪火清空该员工所有业务未清空记单（不含 USDT / 记账），再同步本机。"""
+    from apps.integrations.xinhuo_push import clear_bot_records_on_xinhuo
     from apps.ledger.ledger_ops import ledger_error_reply
 
     _ = room
     target_name = (getattr(target_employee, "display_name", None) or "").strip() or "—"
-    entries = _load_active_by_display_name(target_name)
-    if not entries:
-        return ledger_error_reply(f"ℹ️ 「{target_name}」没有可清空的记单")
+    result = clear_bot_records_on_xinhuo(employee_name=target_name)
+    if result is None:
+        return ledger_error_reply(XINHUO_DOWN_MSG.format(what="清空"))
 
     who = (employee.display_name if employee else "") or "操作人"
     when = timezone.now()
-    per_biz: dict[str, int] = defaultdict(int)
-    for e in entries:
-        per_biz[(e.business_name or "").strip() or "未命名"] += 1
-
-    ids = [e.id for e in entries]
-    LedgerEntry.objects.filter(id__in=ids).update(
-        status=LedgerEntry.Status.PROCESSED,
-        reverse_reason=f"清空记单 全部业务/{target_name} by {who}"[:255],
-        reversed_at=when,
-        updated_at=when,
+    _mark_local_processed(
+        _load_active_by_display_name(target_name),
+        f"清空记单 全部业务/{target_name} by {who}",
+        when,
     )
-    try:
-        from apps.integrations.xinhuo_push import schedule_push_status
+    count = int(result.get("cleared") or 0)
+    if count == 0:
+        return ledger_error_reply(f"ℹ️ 「{target_name}」没有可清空的记单")
 
-        for e in entries:
-            e.status = LedgerEntry.Status.PROCESSED
-            schedule_push_status(e)
-    except Exception:
-        pass
-
-    parts = [
-        "清空记单成功",
+    # by_table 的键是薪火表名（充币 / gpt / 远程…），与机器人业务名一致
+    parts = ["清空记单成功", REPLY_SEP, f"员工：{target_name}"]
+    for label, n in sorted((result.get("by_table") or {}).items()):
+        parts.append(f"{label}：{int(n)}条")
+    parts += [
+        f"清空条数：{count}条",
         REPLY_SEP,
-        f"员工：{target_name}",
+        f"操作人：{(who or '').strip() or '—'}",
+        f"清空时间：{fmt_ts(when)}",
     ]
-    for biz in sorted(per_biz.keys()):
-        parts.append(f"{biz}：{per_biz[biz]}条")
-    parts.append(f"清空条数：{len(entries)}条")
-    parts.append(REPLY_SEP)
-    parts.append(f"操作人：{(who or '').strip() or '—'}")
-    parts.append(f"清空时间：{fmt_ts(when)}")
     return "\n".join(parts)

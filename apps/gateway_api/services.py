@@ -272,9 +272,7 @@ def process_gateway_message(payload: dict, gateway_id: str) -> dict:
     from apps.ledger.ledger_ops import ledger_error_reply
 
     need_book = (parsed.book or "").strip()
-    if parsed.command == "usdt_settlement_clear":
-        need_book = "usdt"
-    elif parsed.command == "usdt_query":
+    if parsed.command == "usdt_query":
         need_book = "usdt"
     elif parsed.command in {
         "ledger_query",
@@ -651,22 +649,6 @@ def process_gateway_message(payload: dict, gateway_id: str) -> dict:
             "command": "usdt_query",
         }
 
-    if parsed.command == "usdt_settlement_clear":
-        denied = _require_room_admin("已转账")
-        if denied:
-            return denied
-        from apps.ledger.ledger_ops import clear_usdt_settlements
-
-        event.parse_status = MessageEvent.ParseStatus.ACCEPTED
-        event.save()
-        body = clear_usdt_settlements(room, employee, event=event)
-        _enqueue_reply(event, chat_name, body)
-        return {
-            "status": "accepted",
-            "event_uuid": event.event_uuid,
-            "command": "usdt_settlement_clear",
-        }
-
     if parsed.command == "staff_order_query_employee":
         from apps.ledger.ledger_ops import ledger_error_reply
         from apps.ledger.staff_order_ops import (
@@ -1027,6 +1009,17 @@ def process_gateway_message(payload: dict, gateway_id: str) -> dict:
         else:
             display_biz = biz
             self_net = net_for_employee(room, biz, employee)
+        # 本人合计以薪火为准（薪火手工改过也能对上）；薪火连不上才用本机数
+        try:
+            from apps.ledger.staff_order_ops import remote_self_net
+
+            remote_net = remote_self_net(
+                entry, sku_remark=sku_remark if is_multi_sku(biz) else ""
+            )
+        except Exception:
+            remote_net = None
+        if remote_net is not None:
+            self_net = remote_net
         reply = staff_order_success_reply(
             business_name=display_biz,
             delta=delta,
