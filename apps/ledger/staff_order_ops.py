@@ -626,3 +626,49 @@ def clear_staff_order_business(
         target_name=target_name,
         when=when,
     )
+
+
+def clear_staff_order_by_employee(room, employee, *, target_employee) -> str:
+    """清空-姓名：按统一备注名跨群清空该员工全部业务的未清空记单（不含 USDT / 记账）。"""
+    from apps.ledger.ledger_ops import ledger_error_reply
+
+    _ = room
+    target_name = (getattr(target_employee, "display_name", None) or "").strip() or "—"
+    entries = _load_active_by_display_name(target_name)
+    if not entries:
+        return ledger_error_reply(f"ℹ️ 「{target_name}」没有可清空的记单")
+
+    who = (employee.display_name if employee else "") or "操作人"
+    when = timezone.now()
+    per_biz: dict[str, int] = defaultdict(int)
+    for e in entries:
+        per_biz[(e.business_name or "").strip() or "未命名"] += 1
+
+    ids = [e.id for e in entries]
+    LedgerEntry.objects.filter(id__in=ids).update(
+        status=LedgerEntry.Status.PROCESSED,
+        reverse_reason=f"清空记单 全部业务/{target_name} by {who}"[:255],
+        reversed_at=when,
+        updated_at=when,
+    )
+    try:
+        from apps.integrations.xinhuo_push import schedule_push_status
+
+        for e in entries:
+            e.status = LedgerEntry.Status.PROCESSED
+            schedule_push_status(e)
+    except Exception:
+        pass
+
+    parts = [
+        "清空记单成功",
+        REPLY_SEP,
+        f"员工：{target_name}",
+    ]
+    for biz in sorted(per_biz.keys()):
+        parts.append(f"{biz}：{per_biz[biz]}条")
+    parts.append(f"清空条数：{len(entries)}条")
+    parts.append(REPLY_SEP)
+    parts.append(f"操作人：{(who or '').strip() or '—'}")
+    parts.append(f"清空时间：{fmt_ts(when)}")
+    return "\n".join(parts)

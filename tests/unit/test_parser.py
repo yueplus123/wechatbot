@@ -457,3 +457,28 @@ def test_clear_reply_template():
     assert "清空条数：3条" in body
     assert "操作人：啊吧" in body
     assert "清空时间：" in body
+
+
+def test_remote_biz_commands():
+    from apps.ledger.staff_order_catalog import expand_triggers
+
+    m = expand_triggers({"远程"})
+    r = parse_command("远程+1", staff_biz_map=m)
+    assert r.command == "staff_order_add" and r.business_name == "远程"
+    assert str(r.amount) == "1.00" and r.direction.value == "INCOME"
+    r = parse_command("查询远程-张越", staff_biz_map=m)
+    assert r.command == "staff_order_query" and r.remark == "张越"
+    r = parse_command("清空远程-张越", staff_biz_map=m)
+    assert r.command == "staff_order_clear" and r.business_name == "远程"
+
+
+def test_clear_all_by_employee():
+    r = parse_command("清空-李振宇")
+    assert r.command == "staff_order_clear_employee"
+    assert r.remark == "李振宇" and r.book == "staff_order"
+    r = parse_command("清空 － 张三")
+    assert r.command == "staff_order_clear_employee" and r.remark == "张三"
+    r = parse_command("清空-")
+    assert r.status == ParseStatus.ERROR
+    # USDT 清账不受影响
+    assert parse_command("清空usdt").command == "usdt_settlement_clear"

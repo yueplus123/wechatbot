@@ -94,6 +94,11 @@ def parse_command(
     if emp_hit is not None:
         return emp_hit
 
+    # 管理员按员工清空全部业务记单：清空-李振宇
+    emp_clear = _parse_staff_employee_clear(normalized, rule_version=rule_version)
+    if emp_clear is not None:
+        return emp_clear
+
     if staff_biz_map:
         staff_hit = _parse_staff_order(
             normalized,
@@ -207,6 +212,33 @@ def _parse_staff_employee_query(
     return ParseResult(
         status=ParseStatus.OK,
         command="staff_order_query_employee",
+        book="staff_order",
+        remark=name[:64],
+        rule_version=rule_version,
+        normalized_text=text,
+    )
+
+
+def _parse_staff_employee_clear(
+    text: str,
+    *,
+    rule_version: str,
+) -> ParseResult | None:
+    """清空-李振宇 → 管理员清空该员工全部业务的未清空记单（不含 USDT / 记账）。"""
+    m = re.fullmatch(r"清空\s*[-－—]\s*(.*)", text)
+    if not m:
+        return None
+    name = (m.group(1) or "").strip()
+    if not name:
+        return _err(
+            "E001",
+            "请写员工备注名。例：清空-李振宇",
+            text,
+            rule_version,
+        )
+    return ParseResult(
+        status=ParseStatus.OK,
+        command="staff_order_clear_employee",
         book="staff_order",
         remark=name[:64],
         rule_version=rule_version,

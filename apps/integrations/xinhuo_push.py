@@ -46,6 +46,7 @@ _BIZ_TO_TABLE_TYPE: dict[str, str] = {
     "booth": "booth",
     "pictspace": "pictspace",
     "pict": "pictspace",
+    "远程": "remote",
     "高级会员": "premium",
     "会员": "premium",
     "mega": "mega",

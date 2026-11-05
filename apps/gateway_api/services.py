@@ -885,6 +885,60 @@ def process_gateway_message(payload: dict, gateway_id: str) -> dict:
             "command": "staff_order_clear",
         }
 
+    if parsed.command == "staff_order_clear_employee":
+        from apps.ledger.ledger_ops import ledger_error_reply
+        from apps.ledger.staff_order_ops import (
+            clear_staff_order_by_employee,
+            find_room_employee_by_name,
+        )
+
+        # 仅管理员可清空（含清空本人）；员工一律不可清空
+        if not room_admin:
+            event.parse_status = MessageEvent.ParseStatus.REJECTED
+            event.error_code = "E003"
+            event.error_message = "仅管理员可清空记单"
+            event.save()
+            _enqueue_reply(
+                event,
+                chat_name,
+                ledger_error_reply(
+                    "❌ 仅管理员可清空记单（员工不可清空，含本人）。例：清空-张越"
+                ),
+            )
+            return {
+                "status": "rejected",
+                "error_code": "E003",
+                "event_uuid": event.event_uuid,
+            }
+        target_name = (parsed.remark or "").strip()
+        target = find_room_employee_by_name(room, target_name) if target_name else None
+        if target is None:
+            event.parse_status = MessageEvent.ParseStatus.REJECTED
+            event.error_code = "E004"
+            event.error_message = f"未找到员工：{target_name}"
+            event.save()
+            _enqueue_reply(
+                event,
+                chat_name,
+                ledger_error_reply(
+                    f"❌ 未找到员工「{target_name}」。请核对管理人员里的统一备注名。"
+                ),
+            )
+            return {
+                "status": "rejected",
+                "error_code": "E004",
+                "event_uuid": event.event_uuid,
+            }
+        event.parse_status = MessageEvent.ParseStatus.ACCEPTED
+        event.save()
+        body = clear_staff_order_by_employee(room, employee, target_employee=target)
+        _enqueue_reply(event, chat_name, body)
+        return {
+            "status": "accepted",
+            "event_uuid": event.event_uuid,
+            "command": "staff_order_clear_employee",
+        }
+
     if parsed.command == "staff_order_add":
         from apps.ledger.ledger_ops import ledger_error_reply
         from apps.ledger.staff_order_catalog import is_multi_sku

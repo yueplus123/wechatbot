@@ -70,6 +70,7 @@ STAFF_BIZ_CATALOG: tuple[StaffBizDef, ...] = (
     StaffBizDef("约稿"),
     StaffBizDef("booth"),
     StaffBizDef("pictspace", ("pict",)),
+    StaffBizDef("远程"),
     # —— 多 SKU ——
     StaffBizDef(
         "高级会员",
