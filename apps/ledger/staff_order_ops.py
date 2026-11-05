@@ -370,7 +370,10 @@ def _remote_biz_variant(rec: dict) -> tuple[str, str]:
 
 
 def _pull_remote(employee_name: str, business_name: str = "") -> list[dict] | None:
-    """拉取薪火未清空记单（不含 USDT）。失败返回 None。"""
+    """拉取薪火未清空记单（不含 USDT；未指定远程时也不含远程）。失败返回 None。"""
+    from apps.ledger.staff_order_catalog import is_amount_biz
+
+    want_amount_biz = is_amount_biz(business_name)
     try:
         from apps.integrations.xinhuo_push import pull_bot_records_from_xinhuo
 
@@ -385,7 +388,10 @@ def _pull_remote(employee_name: str, business_name: str = "") -> list[dict] | No
         return None
     rows = []
     for r in data.get("records") or []:
-        if str(r.get("table_type") or "").lower() == "usdt":
+        tt = str(r.get("table_type") or "").lower()
+        if tt == "usdt":
+            continue
+        if not want_amount_biz and is_amount_biz(_remote_biz_variant(r)[0]):
             continue
         rows.append(r)
     return rows
@@ -614,8 +620,14 @@ def clear_staff_order_by_employee(room, employee, *, target_employee) -> str:
 
     who = (employee.display_name if employee else "") or "操作人"
     when = timezone.now()
+    from apps.ledger.staff_order_catalog import is_amount_biz
+
     _mark_local_processed(
-        _load_active_by_display_name(target_name),
+        [
+            e
+            for e in _load_active_by_display_name(target_name)
+            if not is_amount_biz(e.business_name)
+        ],
         f"清空记单 全部业务/{target_name} by {who}",
         when,
     )
@@ -634,3 +646,124 @@ def clear_staff_order_by_employee(room, employee, *, target_employee) -> str:
         f"清空时间：{fmt_ts(when)}",
     ]
     return "\n".join(parts)
+
+
+# —— 远程（按金额记，管理员自用，只针对发消息的本人）——
+REMOTE_BIZ = "远程"
+
+
+def fmt_yuan_plain(amount) -> str:
+    return f"{fmt_num(amount)}元"
+
+
+def _remote_amount(rec: dict) -> Decimal:
+    raw = rec.get("amount_cny")
+    if raw in (None, ""):
+        raw = rec.get("amount")
+    try:
+        return Decimal(str(raw if raw not in (None, "") else 0))
+    except Exception:
+        return Decimal("0")
+
+
+def _local_remote_total(name: str) -> Decimal:
+    total = Decimal("0")
+    for e in _load_active_by_display_name(name, business_name=REMOTE_BIZ):
+        total += entry_delta(e)
+    return total.quantize(Decimal("0.01"))
+
+
+def remote_add_reply(entry: LedgerEntry) -> str:
+    """远程金额39 → 记录成功；本人未清空合计以薪火为准（薪火连不上用本机数）。"""
+    from apps.integrations.xinhuo_push import entry_event_id
+
+    name = (getattr(entry.employee, "display_name", None) or "").strip()
+    rows = _pull_remote(name, REMOTE_BIZ)
+    if rows is None:
+        total = _local_remote_total(name)
+    else:
+        this_id = entry_event_id(entry)
+        total = sum(
+            (
+                _remote_amount(r)
+                for r in rows
+                if _remote_biz_variant(r)[0] == REMOTE_BIZ
+                and str(r.get("event_id") or r.get("external_id") or "") != this_id
+            ),
+            Decimal("0"),
+        ) + entry_delta(entry)
+    return "\n".join(
+        [
+            "记录成功",
+            REPLY_SEP,
+            f"项目：{REMOTE_BIZ}",
+            f"金额：{fmt_yuan_plain(entry.amount)}",
+            f"本人未清空合计：{fmt_yuan_plain(total)}",
+            REPLY_SEP,
+            f"记录人：{name or '—'}",
+            f"记录时间：{fmt_ts(entry.occurred_at)}",
+        ]
+    )
+
+
+def format_remote_query(employee) -> str:
+    """查询远程 → 本人未清空的远程记录（以薪火为准）。"""
+    from apps.ledger.ledger_ops import ledger_error_reply
+
+    name = (getattr(employee, "display_name", None) or "").strip() or "—"
+    rows = _pull_remote(name, REMOTE_BIZ)
+    if rows is None:
+        return ledger_error_reply(XINHUO_DOWN_MSG.format(what="查询"))
+    rows = [r for r in rows if _remote_biz_variant(r)[0] == REMOTE_BIZ]
+    parts = ["远程查询", f"员工：{name}", REPLY_SEP]
+    if not rows:
+        parts += ["暂无未清空记录", REPLY_SEP]
+    else:
+        total = Decimal("0")
+        for r in rows:
+            amt = _remote_amount(r)
+            total += amt
+            parts.append(f"{_occurred_ts_from_remote(r) or '—'}  {fmt_yuan_plain(amt)}")
+        parts += [REPLY_SEP, f"合计：{fmt_yuan_plain(total)}（{len(rows)}笔）", REPLY_SEP]
+    parts.append(f"查询时间：{fmt_ts()}")
+    return "\n".join(parts)
+
+
+def clear_remote(employee) -> str:
+    """清空远程 → 只清本人未清空的远程记录（先清薪火，再同步本机）。"""
+    from apps.integrations.xinhuo_push import clear_bot_records_on_xinhuo
+    from apps.ledger.ledger_ops import ledger_error_reply
+
+    name = (getattr(employee, "display_name", None) or "").strip()
+    if not name:
+        return ledger_error_reply("❌ 无法确认本人备注名，未清空。")
+    rows = _pull_remote(name, REMOTE_BIZ)
+    if rows is None:
+        return ledger_error_reply(XINHUO_DOWN_MSG.format(what="清空"))
+    total = sum(
+        (_remote_amount(r) for r in rows if _remote_biz_variant(r)[0] == REMOTE_BIZ),
+        Decimal("0"),
+    )
+    result = clear_bot_records_on_xinhuo(employee_name=name, business_name=REMOTE_BIZ)
+    if result is None:
+        return ledger_error_reply(XINHUO_DOWN_MSG.format(what="清空"))
+    when = timezone.now()
+    _mark_local_processed(
+        _load_active_by_display_name(name, business_name=REMOTE_BIZ),
+        f"清空远程/{name}",
+        when,
+    )
+    count = int(result.get("cleared") or 0)
+    if count == 0:
+        return ledger_error_reply("ℹ️ 你没有未清空的远程记录")
+    return "\n".join(
+        [
+            "清空远程成功",
+            REPLY_SEP,
+            f"员工：{name}",
+            f"清空条数：{count}条",
+            f"清空金额：{fmt_yuan_plain(total)}",
+            REPLY_SEP,
+            f"清空时间：{fmt_ts(when)}",
+        ]
+    )

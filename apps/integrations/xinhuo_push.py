@@ -204,6 +204,24 @@ def build_bot_record_payload(entry: "LedgerEntry") -> dict | None:
     }
     if table_type:
         payload["table_type"] = table_type
+
+    # 远程：按金额记，数量为 0；金额进薪火「金额」列（amount / amount_cny）
+    from apps.ledger.staff_order_catalog import is_amount_biz
+
+    if is_amount_biz(biz):
+        money = Decimal(entry.amount or 0).quantize(Decimal("0.01"))
+        if direction == "EXPENSE":
+            money = -abs(money)
+        payload.update(
+            {
+                "quantity": 0,
+                "amount": str(money),
+                "amount_cny": str(money),
+                "receive_amount": str(money),
+                "business_name": biz,
+                "remark": biz,
+            }
+        )
     return payload
 
 

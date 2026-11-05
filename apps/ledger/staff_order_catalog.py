@@ -82,6 +82,14 @@ STAFF_BIZ_CATALOG: tuple[StaffBizDef, ...] = (
 
 STAFF_BIZ_KEYS: frozenset[str] = frozenset(b.key for b in STAFF_BIZ_CATALOG)
 
+# 按金额记（不是单数）的业务：管理员自用，指令为「远程金额39 / 查询远程 / 清空远程」，
+# 只针对发消息的本人；不参与「查询-姓名 / 清空-姓名」。
+AMOUNT_BIZ_KEYS: frozenset[str] = frozenset({"远程"})
+
+
+def is_amount_biz(business_name: str) -> bool:
+    return (business_name or "").strip() in AMOUNT_BIZ_KEYS
+
 # 旧 biz_key / 独立业务名 → 新规范名
 LEGACY_BIZ_KEY_MAP: dict[str, str] = {
     "plus": "gpt",

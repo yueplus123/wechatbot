@@ -36,7 +36,8 @@ REPLY_COMMAND_FOOTER = """📒 指令说明
 • 查询全部：查询-姓名（该员工所有未清空记单）
 • 清空单项（管理员）：清空业务名-姓名（例：清空充币-李振宇）
 • 清空全部（管理员）：清空-姓名
-• 业务：充币 共享 打包 openrouter patreon booth pictspace mega gpt 一次卡 远程
+• 业务：充币 共享 打包 openrouter patreon booth pictspace mega gpt 一次卡
+【远程】管理员本人按金额记：远程金额39 ／ 查询远程 ／ 清空远程
 【帮助】发「记账」查看本说明"""
 
 
@@ -402,6 +403,7 @@ LEDGER_HELP_TEXT = (
     f"{REPLY_SEP}\n"
     f"记单：业务名+1 ／ 查询业务名-姓名 ／ 清空业务名-姓名\n"
     f"全部：查询-姓名 ／ 清空-姓名（清空仅管理员）\n"
+    f"远程（管理员本人）：远程金额39 ／ 查询远程 ／ 清空远程\n"
     f"{REPLY_SEP}\n"
     f"{fmt_ts()}"
 )

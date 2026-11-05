@@ -100,6 +100,10 @@ DEFAULT_KEYWORDS: list[tuple[str, str, list[str]]] = [
 
 def _staff_usages_for_biz(biz) -> list[str]:
     """根据单/多 SKU 生成用法示例。"""
+    from apps.ledger.staff_order_catalog import is_amount_biz
+
+    if is_amount_biz(biz.key):
+        return [f"{biz.key}金额39", f"查询{biz.key}", f"清空{biz.key}"]
     samples: list[str] = [
         f"查询{biz.key}-张越",
         f"清空{biz.key}-张越",

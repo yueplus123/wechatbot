@@ -465,16 +465,25 @@ def test_clear_reply_template():
 
 
 def test_remote_biz_commands():
+    """远程：按金额记，管理员本人用。"""
     from apps.ledger.staff_order_catalog import expand_triggers
 
-    m = expand_triggers({"远程"})
-    r = parse_command("远程+1", staff_biz_map=m)
-    assert r.command == "staff_order_add" and r.business_name == "远程"
-    assert str(r.amount) == "1.00" and r.direction.value == "INCOME"
-    r = parse_command("查询远程-张越", staff_biz_map=m)
-    assert r.command == "staff_order_query" and r.remark == "张越"
-    r = parse_command("清空远程-张越", staff_biz_map=m)
-    assert r.command == "staff_order_clear" and r.business_name == "远程"
+    m = expand_triggers({"远程", "充币"})
+    r = parse_command("远程金额39", staff_biz_map=m)
+    assert r.command == "remote_add" and r.business_name == "远程"
+    assert str(r.amount) == "39.00" and r.currency == "CNY"
+    assert parse_command("远程 金额 39.5", staff_biz_map=m).command == "remote_add"
+    assert parse_command("远程金额0", staff_biz_map=m).status == ParseStatus.ERROR
+    assert parse_command("查询远程", staff_biz_map=m).command == "remote_query"
+    assert parse_command("清空远程", staff_biz_map=m).command == "remote_clear"
+    # 旧写法不再支持 → 提示新指令
+    for old in ("远程+1", "远程 10", "查询远程-张越", "清空远程-张越"):
+        r = parse_command(old, staff_biz_map=m)
+        assert r.status == ParseStatus.ERROR and "远程金额39" in r.error_message
+    # 普通聊天不受影响
+    assert parse_command("远程桌面连不上", staff_biz_map=m).status == ParseStatus.IGNORED
+    # 其它业务照旧
+    assert parse_command("充币+1", staff_biz_map=m).command == "staff_order_add"
 
 
 def test_clear_all_by_employee():

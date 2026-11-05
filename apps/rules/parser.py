@@ -89,6 +89,11 @@ def parse_command(
     if usdt_hit is not None:
         return usdt_hit
 
+    # 远程（按金额记，管理员自用）：远程金额39 / 查询远程 / 清空远程
+    remote_hit = _parse_remote(normalized, rule_version=rule_version)
+    if remote_hit is not None:
+        return remote_hit
+
     # 管理员按员工查记单：查询-李振宇
     emp_hit = _parse_staff_employee_query(normalized, rule_version=rule_version)
     if emp_hit is not None:
@@ -99,6 +104,12 @@ def parse_command(
     if emp_clear is not None:
         return emp_clear
 
+    if staff_biz_map:
+        from apps.ledger.staff_order_catalog import AMOUNT_BIZ_KEYS
+
+        staff_biz_map = {
+            k: v for k, v in staff_biz_map.items() if v not in AMOUNT_BIZ_KEYS
+        }
     if staff_biz_map:
         staff_hit = _parse_staff_order(
             normalized,
@@ -217,6 +228,59 @@ def _parse_staff_employee_query(
         rule_version=rule_version,
         normalized_text=text,
     )
+
+
+REMOTE_BIZ = "远程"
+REMOTE_HINT = "远程指令：远程金额39 ／ 查询远程 ／ 清空远程"
+
+
+def _parse_remote(text: str, *, rule_version: str) -> ParseResult | None:
+    """远程：按金额记，只针对发消息的本人。"""
+    if REMOTE_BIZ not in text:
+        return None
+
+    def ok(command: str, **kw) -> ParseResult:
+        return ParseResult(
+            status=ParseStatus.OK,
+            command=command,
+            book="staff_order",
+            business_name=REMOTE_BIZ,
+            remark=REMOTE_BIZ,
+            rule_version=rule_version,
+            normalized_text=text,
+            **kw,
+        )
+
+    m = re.fullmatch(r"远程\s*金额\s*(\S+)", text)
+    if m:
+        amt = _parse_staff_amount(m.group(1))
+        if amt is None:
+            return _err(
+                "E002",
+                "金额须为大于 0 的数字，最多两位小数。例：远程金额39",
+                text,
+                rule_version,
+            )
+        return ok(
+            "remote_add",
+            direction=Direction.INCOME,
+            amount=amt,
+            currency="CNY",
+            category="其他",
+            receive_amount=amt,
+        )
+    if re.fullmatch(r"查询\s*远程|远程\s*查询", text):
+        return ok("remote_query")
+    if re.fullmatch(r"清空\s*远程|远程\s*清空", text):
+        return ok("remote_clear")
+    # 旧写法（远程+1 / 查询远程-姓名 / 清空远程-姓名 …）不再支持，给出提示
+    if re.fullmatch(
+        r"远程\s*[+\-]?\s*\d+(?:\.\d+)?|远程\s*(?:增加|减少)\s*\d+(?:\.\d+)?"
+        r"|(?:查询|清空)\s*远程\s*[-－—].*|远程\s*(?:查询|清空)\s*[-－—].*",
+        text,
+    ):
+        return _err("E001", REMOTE_HINT, text, rule_version)
+    return None
 
 
 def _parse_staff_employee_clear(

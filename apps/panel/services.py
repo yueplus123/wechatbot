@@ -282,6 +282,8 @@ def load_room_settings(room_name: str) -> dict[str, Any]:
         else:
             if b.aliases:
                 item["hint"] = "别名：" + "、".join(b.aliases)
+            if b.key == "远程":
+                item["hint"] = "按金额记，仅管理员本人：远程金额39 / 查询远程 / 清空远程"
             biz_simple.append(item)
 
     if not books:

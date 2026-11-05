@@ -400,6 +400,7 @@ def process_gateway_message(payload: dict, gateway_id: str) -> dict:
                 "ledger_query_last_month",
                 "ledger_query_week",
                 "usdt_query",
+                "remote_query",
             }
             if use_alias:
                 try:
@@ -647,6 +648,114 @@ def process_gateway_message(payload: dict, gateway_id: str) -> dict:
             "status": "accepted",
             "event_uuid": event.event_uuid,
             "command": "usdt_query",
+        }
+
+    if parsed.command in {"remote_add", "remote_query", "remote_clear"}:
+        from apps.ledger.books import load_staff_biz_for_chat
+        from apps.ledger.ledger_ops import ledger_error_reply
+        from apps.ledger.staff_order_ops import (
+            REMOTE_BIZ,
+            clear_remote,
+            format_remote_query,
+            remote_add_reply,
+        )
+
+        if REMOTE_BIZ not in set(load_staff_biz_for_chat(chat_name).values()):
+            event.parse_status = MessageEvent.ParseStatus.REJECTED
+            event.error_code = "E003"
+            event.error_message = "本群未启用远程"
+            event.save()
+            _enqueue_reply(
+                event,
+                chat_name,
+                ledger_error_reply(
+                    "❌ 本群未启用「远程」。请在听群→群设置的记单业务里勾选「远程」后保存。"
+                ),
+            )
+            return {
+                "status": "rejected",
+                "error_code": "E003",
+                "event_uuid": event.event_uuid,
+            }
+        # 远程仅管理员自用，和记账一样
+        denied = _require_room_admin("使用远程")
+        if denied:
+            return denied
+
+        if parsed.command == "remote_query":
+            event.parse_status = MessageEvent.ParseStatus.ACCEPTED
+            event.save()
+            _enqueue_reply(event, chat_name, format_remote_query(employee))
+            return {
+                "status": "accepted",
+                "event_uuid": event.event_uuid,
+                "command": "remote_query",
+            }
+
+        if parsed.command == "remote_clear":
+            event.parse_status = MessageEvent.ParseStatus.ACCEPTED
+            event.save()
+            _enqueue_reply(event, chat_name, clear_remote(employee))
+            return {
+                "status": "accepted",
+                "event_uuid": event.event_uuid,
+                "command": "remote_clear",
+            }
+
+        # remote_add
+        assert parsed.amount is not None
+        cat = ensure_fallback_category(LedgerEntry.Direction.INCOME)
+        event.parse_status = MessageEvent.ParseStatus.ACCEPTED
+        event.save()
+        record_no = next_record_no()
+        entry = None
+        for _ in range(5):
+            try:
+                entry = LedgerEntry.objects.create(
+                    record_no=record_no,
+                    event=event,
+                    book=LedgerEntry.Book.STAFF_ORDER,
+                    direction=LedgerEntry.Direction.INCOME,
+                    amount=Decimal(parsed.amount),
+                    currency="CNY",
+                    category=cat,
+                    employee=employee,
+                    chat_room=room,
+                    remark=REMOTE_BIZ,
+                    business_name=REMOTE_BIZ,
+                    receive_amount=Decimal(parsed.amount),
+                    amount_to_you=Decimal("0"),
+                    amount_to_me=Decimal("0"),
+                    profit_amount=Decimal("0"),
+                    occurred_at=client_observed_at,
+                    status=LedgerEntry.Status.ACTIVE,
+                )
+                break
+            except IntegrityError:
+                record_no = next_record_no()
+        if entry is None:
+            event.parse_status = MessageEvent.ParseStatus.ERROR
+            event.error_code = "E500"
+            event.error_message = "record_no_conflict"
+            event.save(update_fields=["parse_status", "error_code", "error_message"])
+            _enqueue_reply(
+                event, chat_name, ledger_error_reply("⚠️ 本次记录未成功，请稍后重试。")
+            )
+            return {"status": "rejected", "error_code": "E500"}
+        try:
+            from apps.integrations.xinhuo_push import schedule_push_bot_record
+
+            schedule_push_bot_record(entry)
+        except Exception:
+            logger.exception("schedule xinhuo remote push failed record_no=%s", entry.record_no)
+        reply = remote_add_reply(entry)
+        _enqueue_reply(event, chat_name, reply)
+        return {
+            "status": "accepted",
+            "event_uuid": event.event_uuid,
+            "record_no": entry.record_no,
+            "reply_preview": reply,
+            "command": "remote_add",
         }
 
     if parsed.command == "staff_order_query_employee":
