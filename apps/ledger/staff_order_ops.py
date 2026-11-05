@@ -228,27 +228,13 @@ def staff_order_query_variants_reply(
         parts.append("暂无记录")
         parts.append(REPLY_SEP)
     else:
-        for label, net in _display_variants(variants, business_name, keep_single=True):
+        for label, net in variants:
             parts.append(f"{label}：{fmt_orders(net)}")
         parts.append(REPLY_SEP)
         parts.append(f"合计：{fmt_orders(total_net)}")
         parts.append(REPLY_SEP)
     parts.append(f"查询时间：{fmt_ts(when)}")
     return "\n".join(parts)
-
-
-UNSPEC_SKU_LABEL = "未分规格"
-
-
-def _display_variants(
-    items: list[tuple[str, Decimal]], business_name: str, *, keep_single: bool = False
-) -> list[tuple[str, Decimal]]:
-    """多规格明细展示：没写规格的记录（规格=业务名，如 gpt+1）显示为「未分规格」；
-    若全部都没写规格，则不再重复列明细（keep_single=True 时保留一行）。"""
-    biz = (business_name or "").strip()
-    if not keep_single and all(lab == biz for lab, _ in items):
-        return []
-    return [(UNSPEC_SKU_LABEL if lab == biz else lab, net) for lab, net in items]
 
 
 def _entry_variant_label(entry: LedgerEntry, business_name: str) -> str:
@@ -478,7 +464,7 @@ def format_staff_order_query_by_employee(room, target_employee) -> str:
                 sub = sum((n for _, n in items), Decimal("0")).quantize(Decimal("0.01"))
                 total += sub
                 parts.append(f"{biz}：{fmt_orders(sub)}")
-                for lab, net in _display_variants(items, biz):
+                for lab, net in items:
                     parts.append(f"  · {lab}：{fmt_orders(net)}")
             else:
                 net = sum(vm.values(), Decimal("0")).quantize(Decimal("0.01"))
